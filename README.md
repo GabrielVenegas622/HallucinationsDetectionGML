@@ -3,15 +3,15 @@
   <img src="https://upload.wikimedia.org/wikipedia/commons/4/47/Logo_UTFSM.png" width="100" alt="UTFSM Logo">
 </div>
 
+-----
+
 # Hallucination Detection in LLM's with GML
 
 This repository contains the source code for the _Graph Machine Learning (IIC3675)_ project by the lecturer Marcelo Mendoza (PUC) and authors Nicolás Schiaffino & Gabriel Venegas (UTFSM).
 
 # Graphical Abstract
 
-
-# Organization of Repository
-## 📁 Project Repository Structure for LLM Hallucination Detection
+# 📁 Project Repository Structure for LLM Hallucination Detection
 
 Here is the description of the suggested repository structure in Markdown, followed by a Tree Diagram, designed for maximum modularity and academic rigor.
 
@@ -94,7 +94,6 @@ Project_Root/
 ├── README.md                       # Project documentation
 └── environment.yml                 # Dependency list
 ```
-
 
 # ToDo
 

@@ -66,3 +66,5 @@ Antes de empezar a escribir código, hay que asegurarse de que el primer paso de
 1.  Clarificar la Extracción de Datos Antes de codificar `trace_extractor.py`, define exactamente qué capas de Llama-3.2-1B vas a muestrear y qué dimensiones de activations y attention scores vas a extraer. [cite_start]¿Extraerás todas las cabezas de atención ($L times H$ dimensiones)[cite 93]
 2.  Definir la Estructura de Datos del Grafo Esboza la clase `Graph` (o la estructura de datos que usarás, e.g., `torch_geometric.data.Data`). [cite_start]¿Cómo representarás las aristas dinámicas (casualmente lower-triangular) y los features de arista (atención entre tokens)[cite 92, 101, 103]
 3.  Primer Prototipo de VAE En un notebook, crea una versión mínima del VAE (incluso si no es un GNN) para verificar que la codificación y decodificación de la dimensionalidad de tus features funciona antes de integrarlo en la lógica de Message Passing.
+
+CUDA toolkit 12.1, torch 2.40 
