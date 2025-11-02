@@ -8,14 +8,22 @@
 This repository contains the source code for the _Graph Machine Learning (IIC3675)_ project by the lecturer Marcelo Mendoza (PUC) and authors Nicolás Schiaffino & Gabriel Venegas (UTFSM).
 
 # ToDo
-### Propuesta 
-- [ ] Graphical abstract.
-- [x] Problema que se aborda en el proyecto.
-- [ ] Técnicas a utilizar.
-- [ ] Datos con los que se va a trabajar.
-- [ ] Elementos Diferenciadores
-- [ ] Plan de actividades, Entregables al avance y a la entrega final.
-- [ ] Video de 3 minutos.
+
 ### Avance
+- [ ] Implementar Llama-1B y generar las respuestas de las preguntas de _TruthfulQA_
+- [ ] Crear script para extraer las atenciones y embeddings de todas las capas para la respuesta generada.
+- [ ] Procesar todas las respuestas con el script para recuperar atenciones y embeddings.
+- [ ] Generar el dataset con cada fila como `[id_pregunta, respuesta, atenciones_capa_k, activaciones_capa_k, ..., atenciones_capa_N, activaciones_capa_N]`
+- [ ] Implementar un proceso de carga de cada fila de dataset para generar el Grafo.
+- [ ] Implementar VAE.
 
 ### Entrega Final
+
+### Propuesta 
+- [x] Graphical abstract.
+- [x] Problema que se aborda en el proyecto.
+- [x] Técnicas a utilizar.
+- [x] Datos con los que se va a trabajar.
+- [x] Elementos Diferenciadores
+- [x] Plan de actividades, Entregables al avance y a la entrega final.
+- [x] Video de 3 minutos.
