@@ -98,14 +98,18 @@ Project_Root/
 # ToDo
 
 ### Avance
-- [ ] Implementar Llama-3.2-1B y generar las respuestas de las preguntas de _TruthfulQA_
-- [ ] Crear script para extraer las atenciones y embeddings de todas las capas para la respuesta generada.
-- [ ] Procesar todas las respuestas con el script para recuperar atenciones y embeddings.
-- [ ] Generar el dataset con cada fila como `[id_pregunta, respuesta, atenciones_capa_k, activaciones_capa_k, ..., atenciones_capa_N, activaciones_capa_N]`
-- [ ] Implementar un proceso de carga de cada fila de dataset para generar el Grafo.
-- [ ] Implementar VAE.
+- [x] ~~Implementar Llama-3.2-1B~~ **ACTUALIZADO: Qwen3-4B-Instruct** y generar las respuestas de las preguntas de ~~_TruthfulQA_~~ **TriviaQA**
+- [x] Crear script para extraer las atenciones y embeddings de todas las capas para la respuesta generada (`trace_extractor.py`)
+- [x] Procesar todas las respuestas con el script para recuperar atenciones y embeddings
+- [x] Generar el dataset con cada fila como `[id_pregunta, respuesta, atenciones_capa_k, activaciones_capa_k, ..., atenciones_capa_N, activaciones_capa_N]`
+- [ ] Implementar un proceso de carga de cada fila de dataset para generar el Grafo (`dataloader`)
+- [ ] Implementar VAE para grafos
 
 ### Entrega Final
+- [ ] Entrenar el VAE de forma no supervisada sobre el dataset mixto
+- [ ] Implementar scripts de scoring de alucinaciones (MLP) sobre la secuencia de z_l
+- [ ] Implementar HaloScope & HalluShift para comparación
+- [ ] Ejecutar evaluación en dataset de test y generar gráficos comparativos
 
 ### Propuesta 
 - [x] Graphical abstract.
@@ -115,3 +119,48 @@ Project_Root/
 - [x] Elementos Diferenciadores
 - [x] Plan de actividades, Entregables al avance y a la entrega final.
 - [x] Video de 3 minutos.
+
+---
+
+## 🚀 Últimas Actualizaciones
+
+### Implementación Fase de Avance (Actualizado)
+
+**Modelo**: `Qwen/Qwen3-4B-Instruct-2507` (reemplaza Llama-3.2-1B)  
+**Dataset**: `TriviaQA` (mandarjoshi/trivia_qa, rc.nocontext) (reemplaza TruthfulQA)
+
+#### Archivos Implementados:
+
+1. **`src/trace_extractor.py`** - Extractor principal de trazas
+   - Carga el modelo Qwen3-4B-Instruct con cuantización 8-bit
+   - Procesa preguntas de TriviaQA
+   - Extrae **hidden states** y **attention matrices** de todas las capas
+   - Guarda datos en `./traces_data/trivia_qa_traces_*.pkl`
+
+2. **`src/inspect_traces.py`** - Script de inspección de datos
+   - Carga y analiza los traces guardados
+   - Muestra estadísticas del dataset
+   - Visualiza ejemplos y dimensiones
+
+3. **Documentación**:
+   - `src/README_trace_extractor.md` - Guía detallada del extractor
+   - `CAMBIOS_IMPLEMENTADOS.md` - Resumen de cambios realizados
+
+#### Uso Rápido:
+
+```bash
+# Extraer trazas (por defecto 100 ejemplos)
+python src/trace_extractor.py
+
+# Inspeccionar datos extraídos
+python src/inspect_traces.py
+```
+
+#### Estructura de Datos Extraídos:
+
+Cada trace contiene:
+- `hidden_states`: `[num_layers][num_tokens][batch, seq_len, hidden_dim]`
+- `attentions`: `[num_layers][num_tokens][batch, num_heads, seq_len, seq_len]`
+- Metadata: pregunta, respuesta, tokens, ground truth answers
+
+Ver `src/README_trace_extractor.md` para más detalles.

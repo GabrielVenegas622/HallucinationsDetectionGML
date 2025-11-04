@@ -2,7 +2,9 @@ import torch
 import random
 import os
 import numpy as np
-import evaluate
+import pickle
+from pathlib import Path
+from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from huggingface_hub import login
@@ -27,162 +29,204 @@ def seed_everything(seed: int):
 SEED_VALUE = 41
 
 
+def extract_activations_and_attentions(model, tokenizer, question, answer=None, max_new_tokens=64):
+    """
+    Extrae las activaciones (hidden states) y atenciones de todas las capas
+    durante la generación de una respuesta.
+    
+    Args:
+        model: Modelo de lenguaje cargado
+        tokenizer: Tokenizer correspondiente al modelo
+        question: Pregunta a responder
+        answer: Respuesta de referencia (opcional, para evaluación)
+        max_new_tokens: Número máximo de tokens a generar
+        
+    Returns:
+        dict con:
+            - 'question': pregunta original
+            - 'generated_text': texto generado completo
+            - 'generated_answer': respuesta sin el prompt
+            - 'hidden_states': lista de hidden states por capa y token
+            - 'attentions': lista de matrices de atención por capa y token
+            - 'tokens': tokens generados (IDs)
+    """
+    # Preparar el prompt
+    prompt_text = f"Answer the question concisely. Q: {question} A:"
+    prompt = tokenizer(prompt_text, return_tensors='pt').to(model.device)
+    
+    # Generar con activaciones y atenciones
+    with torch.no_grad():
+        generation_output = model.generate(
+            **prompt,
+            num_beams=5,
+            num_return_sequences=1,
+            do_sample=False,
+            max_new_tokens=max_new_tokens,
+            repetition_penalty=1.2,
+            pad_token_id=tokenizer.eos_token_id,
+            return_dict_in_generate=True,
+            output_attentions=True,
+            output_hidden_states=True
+        )
+    
+    # Decodificar el texto generado
+    generated_ids = generation_output.sequences[0]
+    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    
+    prompt_length = prompt["input_ids"].shape[-1]
+    generated_answer = tokenizer.decode(
+        generation_output.sequences[0, prompt_length:],
+        skip_special_tokens=True
+    )
+    
+    # Extraer hidden states y attentions
+    # generation_output.hidden_states es una tupla de longitud igual al número de tokens generados
+    # Cada elemento es una tupla de tensores (uno por capa + embedding)
+    # generation_output.attentions tiene la misma estructura pero para atenciones
+    
+    num_generated_tokens = len(generation_output.hidden_states)
+    num_layers = len(generation_output.hidden_states[0]) - 1  # -1 porque incluye embeddings
+    
+    # Organizar hidden states: [capa][paso_generación][batch, seq_len, hidden_dim]
+    hidden_states_by_layer = []
+    for layer_idx in range(1, num_layers + 1):  # Empezar desde 1 para saltar embeddings
+        layer_states = []
+        for token_step in range(num_generated_tokens):
+            # Extraer el hidden state de esta capa en este paso
+            state = generation_output.hidden_states[token_step][layer_idx]
+            layer_states.append(state.cpu().numpy())
+        hidden_states_by_layer.append(layer_states)
+    
+    # Organizar attentions: [capa][paso_generación][batch, num_heads, seq_len, seq_len]
+    attentions_by_layer = []
+    for layer_idx in range(num_layers):
+        layer_attns = []
+        for token_step in range(num_generated_tokens):
+            # Extraer la matriz de atención de esta capa en este paso
+            attn = generation_output.attentions[token_step][layer_idx]
+            layer_attns.append(attn.cpu().numpy())
+        attentions_by_layer.append(layer_attns)
+    
+    return {
+        'question': question,
+        'generated_text': generated_text,
+        'generated_answer': generated_answer,
+        'hidden_states': hidden_states_by_layer,  # [num_layers][num_tokens_generated]
+        'attentions': attentions_by_layer,  # [num_layers][num_tokens_generated]
+        'tokens': generated_ids.cpu().numpy(),
+        'prompt_length': prompt_length,
+        'num_layers': num_layers
+    }
+
 
 def main():
-    # model_id = "meta-llama/Llama-3.2-3B"
-    
-    # model_id = "Qwen/Qwen3-4B"
-    
-    # model_id = "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
-    # model_id = "meta-llama/Llama-3.1-8B-Instruct"
-    # model_id = "meta-llama/Meta-Llama-3-8B-Instruct "
-    # model_id = "Qwen/Qwen2.5-7B-Instruct" # --- fallido ---
-    # model_id = "meta-llama/Llama-3.1-8B-Instruct"
-
+    # Configuración del modelo Qwen3-4B-Instruct
     model_id = "Qwen/Qwen3-4B-Instruct-2507"
-    #model_id = "meta-llama/Llama-3.2-3B-Instruct"
-
-
+    
+    print(f"Cargando modelo: {model_id}")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     bnb_config = BitsAndBytesConfig(
         load_in_8bit=True
-        # load_in_4bit=True,
-        # bnb_4bit_quant_type="nf4", # tipo de cuantificación optimizado
-        # bnb_4bit_compute_dtype=torch.bfloat16 # mantiene la precisión de cómputo alta
     )
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        attn_implementation="eager", 
+        attn_implementation="eager",  # Necesario para extraer atenciones
         quantization_config=bnb_config,
         device_map="auto"
     )
+    
     num_layers = len(model.model.layers)
-    print(num_layers)
-
-    question = ["What U.S. state produces the most peaches?", #0
-                "What percentage of the brain does a human typically use?", #1
-                "What is the spiciest part of a chili pepper?", #2
-                "Why do chameleons change colors?", #3
-                "What color is the sun when viewed from space?", #4
-                "Who won Super Bowl XX?", #5
-                ]
-    prompt = tokenizer(f"Answer the question concisely. Q: {question[5]}" + " A:", return_tensors='pt').to(model.device)
-
-    generation_output = model.generate(**prompt,
-                                        num_beams=5,
-                                        num_return_sequences = 1,
-                                        do_sample=False,
-                                        max_new_tokens=64,
-                                        repetition_penalty=1.2,
-                                        pad_token_id=tokenizer.eos_token_id,
-
-                                        return_dict_in_generate=True,
-                                        output_attentions=True,
-                                        output_hidden_states=True
-                                    )
-
-    # 5. Descodificar e imprimir (verificación)
-    generated_ids = generation_output.sequences[0]
-    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-
-    decoded = tokenizer.decode(generation_output.sequences[0, prompt["input_ids"].shape[-1]:],
-                                        skip_special_tokens=True)
-
-    print("--- Texto Generado en Modo EAGER (Trazas Habilitadas) ---")
-    print(generated_text)
-
-    print("--- Texto Generado en Modo tiktok ---")
-    print(decoded)
-    print("--- Texto hasta el primer . ---")
-    dec = decoded.split('.')[0]
-    print(dec)
-
-
-    # 7. Diagnóstico: Verificar si se generó el token EOS
-    eos_id = tokenizer.eos_token_id
-    generated_token_sequence = generation_output.sequences[0].cpu().numpy()
-
-    # Buscamos el EOS ID en los tokens generados (después de la longitud del prompt)
-    prompt_length = prompt["input_ids"].shape[-1]
-    generated_ids_only = generated_token_sequence[prompt_length:]
-
-    eos_found = eos_id in generated_ids_only
-
-    print(f"\n--- Diagnóstico de Terminación ---")
-    print(f"EOS Token ID (Decimal): {eos_id}")
-    print(f"EOS Token encontrado en la secuencia generada: {eos_found}")
-    print(f"\n--- Secuencia de tokens en id ---")
-    print(generated_ids)
-
-
-    # 6. Acceder a las trazas
-    # Longitud del prompt de entrada
-    prompt_length = prompt["input_ids"].shape[-1]
-
-    # Longitud total de la secuencia generada (Prompt + Respuesta)
-    total_sequence_length = generation_output.sequences.shape[-1]
-
-    # Longitud real de la respuesta generada (el número real de trazas)
-    actual_generated_tokens = total_sequence_length - prompt_length
-
-    print(f"\n--- Conteo de Trazas CORREGIDO ---")
-    print(f"Longitud del Prompt (input_ids): {prompt_length} tokens.")
-    print(f"Longitud de la Secuencia Total: {total_sequence_length} tokens.")
-    print(f"✅ Trazas reales de respuesta capturadas: {actual_generated_tokens} tokens.")
-
-    generated_answer = dec 
+    print(f"Número de capas del modelo: {num_layers}")
     
-    # Simple limpieza: Recortamos el meta-comentario ('The best answer is ...')
-    if "The best answer is" in generated_answer:
-        # Se asume que la respuesta válida es la primera oración o frase
-        candidate = generated_answer.split('\n')[0].strip()
-    else:
-        candidate = generated_answer.strip()
-
-    # 2. Definir Respuestas de Referencia (Ground Truth)
-    # GT para la pregunta: "Asmara international airport is in which country?"
-    ref = "Chameleons change colors to regulate their temperature; Chameleons change colors to protect their territory from other chameleons; Chameleons change color to attract a mate; Chameleons change color to impersonate females; It is a popular misconception that chameleons can blend into any background. They change color to communicate with other chameleons"
-    references = ref.split(';')
+    # Cargar dataset TriviaQA
+    print("\nCargando dataset TriviaQA...")
+    dataset = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext", split="train")
     
-    # 3. Cargar el Evaluador BLEURT
-    # Nota: El checkpoint por defecto puede ser grande (BERT). Puedes usar 'bleurt-tiny-128' 
-    # si tienes problemas de memoria, aunque el Tiny a veces es menos preciso.
-    # Haloscope usa un modelo específico (BLEURT-20) que requiere descarga manual del checkpoint.
-    bleurt = evaluate.load("bleurt", config_name="bleurt-base-128") 
-
-    # 4. Calcular el score BLEURT para cada referencia
-    # Debemos comparar la única respuesta generada (candidate) contra todas las referencias.
+    # Limitar el número de ejemplos para prueba (puedes ajustar según necesites)
+    num_samples = 1  # Cambiar según necesidad
+    dataset = dataset.select(range(min(num_samples, len(dataset))))
     
-    predictions = [candidate] # Solo tenemos una respuesta generada
+    print(f"Número de muestras a procesar: {len(dataset)}")
     
-    # Repetimos la respuesta generada N veces para el formato de 'evaluate.compute'
-    candidate_list = [candidate] * len(references) 
-
-    # Calculamos la puntuación de similitud
-    results = bleurt.compute(
-        predictions=candidate_list, 
-        references=references
-    )
-
-    # 5. Calcular el Score MaxSim (Máxima Similitud)
-    # El MaxSim es el score más alto que obtuvo la respuesta generada frente a CUALQUIER referencia GT.
-    max_bleurt_score = max(results['scores'])
+    # Crear directorio para guardar los traces
+    output_dir = Path("./traces_data")
+    output_dir.mkdir(exist_ok=True)
     
-    # Haloscope utiliza un umbral (thres_gt) para convertir esto en una etiqueta binaria.
-    # Por ejemplo, si thres_gt = 0.5 (como es común):
-    # gt_label = 1 if max_bleurt_score > thres_gt else 0
+    # Procesar cada ejemplo del dataset
+    all_traces = []
+    
+    for idx, example in enumerate(tqdm(dataset, desc="Extrayendo trazas")):
+        question = example['question']
+        # TriviaQA tiene múltiples respuestas posibles
+        answer_aliases = example['answer']['aliases'] if 'answer' in example else None
+        
+        try:
+            # Extraer activaciones y atenciones
+            traces = extract_activations_and_attentions(
+                model=model,
+                tokenizer=tokenizer,
+                question=question,
+                answer=answer_aliases,
+                max_new_tokens=64
+            )
+            
+            # Añadir metadata del ejemplo
+            traces['example_id'] = idx
+            traces['ground_truth_answers'] = answer_aliases
+            
+            all_traces.append(traces)
+            
+            # Mostrar ejemplo cada 10 muestras
+            if idx % 10 == 0:
+                print(f"\n--- Ejemplo {idx} ---")
+                print(f"Pregunta: {question}")
+                print(f"Respuesta generada: {traces['generated_answer'][:100]}...")
+                print(f"Número de capas: {traces['num_layers']}")
+                print(f"Tokens generados: {len(traces['tokens']) - traces['prompt_length']}")
+            
+        except Exception as e:
+            print(f"\nError procesando ejemplo {idx}: {e}")
+            continue
+    
+    # Guardar todos los traces
+    output_file = output_dir / f"trivia_qa_traces_{model_id.split('/')[-1]}.pkl"
+    print(f"\nGuardando traces en {output_file}...")
+    
+    with open(output_file, 'wb') as f:
+        pickle.dump(all_traces, f)
+    
+    print(f"✅ Proceso completado. {len(all_traces)} ejemplos procesados y guardados.")
+    
+    # Análisis básico de los datos extraídos
+    print("\n--- Resumen de datos extraídos ---")
+    if all_traces:
+        sample_trace = all_traces[0]
+        print(f"Estructura de cada trace:")
+        print(f"  - Número de capas: {sample_trace['num_layers']}")
+        print(f"  - Hidden states shape por capa: {len(sample_trace['hidden_states'])} capas")
+        print(f"  - Attentions shape por capa: {len(sample_trace['attentions'])} capas")
+        
+        # Mostrar dimensiones de un ejemplo
+        if sample_trace['hidden_states']:
+            first_layer_first_token = sample_trace['hidden_states'][0][0]
+            print(f"  - Dimensión de hidden state (primera capa, primer token): {first_layer_first_token.shape}")
+        
+        if sample_trace['attentions']:
+            first_layer_first_token_attn = sample_trace['attentions'][0][0]
+            print(f"  - Dimensión de attention (primera capa, primer token): {first_layer_first_token_attn.shape}")
+    
+    return all_traces
 
-    print("\n--- Resultado de Evaluación BLEURT ---")
-    print(f"Respuesta analizada: '{candidate}'")
-    print(f"Puntuaciones de BLEURT vs. Referencias: {results['scores']}")
-    print(f"Máxima Similitud (MaxSim) BLEURT: {max_bleurt_score:.4f}")
 
 if __name__ == '__main__':
     seed_everything(SEED_VALUE)
-    # --- Including the token to access to llama ---
-    with open("llama_token.txt", "r") as file:
-        t = file.read()
-        login(token=t)
-    main()
+    # --- Including the token to access to models if needed ---
+    token_file = Path("llama_token.txt")
+    if token_file.exists():
+        with open(token_file, "r") as file:
+            t = file.read().strip()
+            login(token=t)
+    
+    traces = main()
