@@ -120,55 +120,122 @@ def main():
         print("   Ejecuta primero trace_extractor.py")
         return
     
-    # Buscar archivos pickle
-    pickle_files = list(traces_dir.glob("*.pkl"))
+    # Buscar archivos pickle (batch y archivos antiguos)
+    batch_files = sorted(traces_dir.glob("trivia_qa_traces_batch_*.pkl"))
+    old_files = list(traces_dir.glob("trivia_qa_traces_*.pkl"))
+    old_files = [f for f in old_files if "batch" not in f.name]
     
-    if not pickle_files:
+    if not batch_files and not old_files:
         print(f"❌ No se encontraron archivos .pkl en {traces_dir}")
         return
     
-    print(f"✅ Archivos encontrados:")
-    for i, f in enumerate(pickle_files, 1):
-        print(f"   {i}. {f.name}")
+    # Mostrar información sobre archivos encontrados
+    print(f"{'='*80}")
+    print("ARCHIVOS DE TRACES ENCONTRADOS")
+    print(f"{'='*80}\n")
     
-    # Cargar el primer archivo
-    traces_file = pickle_files[0]
-    print(f"\n📂 Cargando: {traces_file}")
+    if batch_files:
+        print(f"✅ Archivos en batch: {len(batch_files)}")
+        total_size = 0
+        for f in batch_files:
+            size_mb = f.stat().st_size / (1024 * 1024)
+            total_size += size_mb
+            print(f"   • {f.name}: {size_mb:.2f} MB")
+        print(f"\n💾 Tamaño total de batches: {total_size:.2f} MB ({total_size/1024:.2f} GB)")
     
-    try:
-        traces = load_traces(traces_file)
-        print(f"✅ Cargado exitosamente: {len(traces)} traces")
+    if old_files:
+        print(f"\n📦 Archivos individuales (formato antiguo): {len(old_files)}")
+        for f in old_files:
+            size_mb = f.stat().st_size / (1024 * 1024)
+            print(f"   • {f.name}: {size_mb:.2f} MB")
+    
+    # Cargar y analizar batches
+    if batch_files:
+        print(f"\n{'='*80}")
+        print("ANÁLISIS DE BATCHES")
+        print(f"{'='*80}\n")
+        
+        all_traces_count = 0
+        answer_lengths = []
+        
+        # Analizar cada batch
+        for batch_idx, batch_file in enumerate(batch_files):
+            print(f"📂 Cargando batch {batch_idx}: {batch_file.name}...")
+            
+            try:
+                with open(batch_file, 'rb') as f:
+                    traces = load_traces(batch_file)
+                
+                num_traces = len(traces)
+                all_traces_count += num_traces
+                
+                print(f"   ✅ {num_traces} traces en este batch")
+                
+                # Recopilar estadísticas
+                for trace in traces:
+                    num_generated = len(trace['tokens']) - trace['prompt_length']
+                    answer_lengths.append(num_generated)
+                
+                # Mostrar ejemplo del primer batch
+                if batch_idx == 0 and traces:
+                    analyze_trace(traces[0], 0)
+                
+            except Exception as e:
+                print(f"   ❌ Error cargando batch {batch_idx}: {e}")
         
         # Estadísticas globales
-        analyze_dataset_statistics(traces)
+        print(f"\n{'='*80}")
+        print("ESTADÍSTICAS GLOBALES DEL DATASET")
+        print(f"{'='*80}\n")
         
-        # Analizar primer ejemplo
-        if traces:
-            analyze_trace(traces[0], 0)
+        print(f"📊 Total de traces en todos los batches: {all_traces_count}")
         
-        # Analizar algunos ejemplos más
-        if len(traces) > 1:
-            print(f"\n\n{'='*80}")
-            print("EJEMPLOS ADICIONALES (resumen)")
-            print(f"{'='*80}")
-            
-            for idx in [1, 2, 3]:
-                if idx < len(traces):
-                    trace = traces[idx]
+        if answer_lengths:
+            print(f"\n📏 Longitud de respuestas generadas:")
+            print(f"   - Media: {np.mean(answer_lengths):.2f} tokens")
+            print(f"   - Mediana: {np.median(answer_lengths):.2f} tokens")
+            print(f"   - Min: {np.min(answer_lengths)} tokens")
+            print(f"   - Max: {np.max(answer_lengths)} tokens")
+            print(f"   - Std: {np.std(answer_lengths):.2f} tokens")
+        
+        # Mostrar algunos ejemplos de diferentes batches
+        print(f"\n{'='*80}")
+        print("EJEMPLOS DE DIFERENTES BATCHES")
+        print(f"{'='*80}")
+        
+        for batch_idx in [0, len(batch_files)//2, len(batch_files)-1]:
+            if batch_idx < len(batch_files):
+                print(f"\n--- Ejemplo del batch {batch_idx} ---")
+                with open(batch_files[batch_idx], 'rb') as f:
+                    traces = pickle.load(f)
+                if traces:
+                    trace = traces[0]
                     num_gen = len(trace['tokens']) - trace['prompt_length']
-                    print(f"\nTrace #{idx}:")
                     print(f"  Q: {trace['question'][:60]}...")
                     print(f"  A: {trace['generated_answer'][:60]}...")
                     print(f"  Tokens generados: {num_gen}")
+                    print(f"  Batch number: {trace.get('batch_number', 'N/A')}")
+                    print(f"  Global ID: {trace.get('global_example_id', 'N/A')}")
         
-        print(f"\n{'='*80}")
-        print("✅ Análisis completado")
-        print(f"{'='*80}\n")
+    # Si hay archivos antiguos, también analizarlos
+    elif old_files:
+        traces_file = old_files[0]
+        print(f"\n📂 Cargando: {traces_file}")
         
-    except Exception as e:
-        print(f"❌ Error al cargar los traces: {e}")
-        import traceback
-        traceback.print_exc()
+        try:
+            traces = load_traces(traces_file)
+            print(f"✅ Cargado exitosamente: {len(traces)} traces")
+            analyze_dataset_statistics(traces)
+            if traces:
+                analyze_trace(traces[0], 0)
+        except Exception as e:
+            print(f"❌ Error al cargar los traces: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    print(f"\n{'='*80}")
+    print("✅ Análisis completado")
+    print(f"{'='*80}\n")
 
 
 if __name__ == "__main__":

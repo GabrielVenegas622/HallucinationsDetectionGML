@@ -58,22 +58,40 @@ python src/trace_extractor.py
 Puedes ajustar los siguientes parámetros en `main()`:
 
 ```python
-num_samples = 100  # Número de ejemplos a procesar
-max_new_tokens = 64  # Tokens máximos por respuesta
+BATCH_SIZE = 500      # Traces por archivo (500 ≈ 5GB)
+num_samples = None    # None = todo el dataset, o un número específico
+max_new_tokens = 64   # Tokens máximos por respuesta
 ```
+
+**Estimación de espacio en disco:**
+- 1 trace ≈ 10 MB (varía según longitud de respuesta)
+- 500 traces ≈ 5 GB por batch
+- Dataset completo TriviaQA (~87k ejemplos) ≈ 870 GB
+
+**Recomendación:** Empieza con `num_samples = 1000` para probar.
 
 ## Salida
 
-### Archivo Generado
+### Archivos Generados (Modo Batch)
 
-Los datos se guardan en:
+Los datos se guardan en archivos separados cada 500 traces:
 ```
-./traces_data/trivia_qa_traces_Qwen3-4B-Instruct-2507.pkl
+./traces_data/
+├── trivia_qa_traces_batch_0000.pkl  # Traces 0-499
+├── trivia_qa_traces_batch_0001.pkl  # Traces 500-999
+├── trivia_qa_traces_batch_0002.pkl  # Traces 1000-1499
+└── ...
 ```
 
-### Estructura del Pickle
+**Ventajas del modo batch:**
+- ✅ Uso eficiente de memoria (máx ~5GB por batch)
+- ✅ Procesamiento paralelo posible
+- ✅ Recuperación ante fallos (batches ya guardados se conservan)
+- ✅ Carga selectiva de datos
 
-Cada elemento en `all_traces` es un diccionario con:
+### Estructura del Pickle (Por Batch)
+
+Cada batch contiene una lista de diccionarios, donde cada elemento es:
 
 ```python
 {
@@ -85,10 +103,33 @@ Cada elemento en `all_traces` es un diccionario con:
     'tokens': np.ndarray,                 # IDs de tokens generados
     'prompt_length': int,                 # Longitud del prompt
     'num_layers': int,                    # Número de capas
-    'example_id': int,                    # ID del ejemplo
-    'ground_truth_answers': list         # Respuestas correctas
+    'example_id': int,                    # ID dentro del batch (0-499)
+    'global_example_id': int,             # ID global en el dataset
+    'batch_number': int,                  # Número del batch
+    'ground_truth_answers': list          # Respuestas correctas
 }
 ```
+
+### Trabajar con Batches
+
+```python
+from src.batch_loader import TraceBatchLoader
+
+# Inicializar loader
+loader = TraceBatchLoader("./traces_data")
+
+# Iterar sobre todos los traces sin cargar todo en memoria
+for trace in loader.iter_traces():
+    print(trace['question'])
+
+# Cargar un batch específico
+batch_0 = loader.get_batch(0)  # Carga solo 500 traces
+
+# Obtener información sin cargar datos
+info = loader.get_batch_info()
+```
+
+Ver `src/batch_loader.py` para más opciones.
 
 ## Aplicación al Proyecto
 

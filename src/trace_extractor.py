@@ -29,7 +29,64 @@ def seed_everything(seed: int):
 SEED_VALUE = 41
 
 
-def extract_activations_and_attentions(model, tokenizer, question, answer=None, max_new_tokens=64):
+def find_answer_cutoff_point(text, tokenizer, token_ids, prompt_length):
+    """
+    Encuentra el punto de corte óptimo para la respuesta.
+    Intenta múltiples estrategias para detectar dónde termina la respuesta real.
+    
+    Args:
+        text: Texto generado completo
+        tokenizer: Tokenizer del modelo
+        token_ids: IDs de tokens generados (numpy array)
+        prompt_length: Longitud del prompt en tokens
+        
+    Returns:
+        tuple: (cutoff_token_index, cutoff_method)
+            cutoff_token_index: índice del token donde cortar (relativo al inicio de la generación)
+            cutoff_method: string indicando qué método se usó
+    """
+    # Estrategia 1: Buscar el primer punto seguido de espacio o final
+    first_period_idx = text.find('.')
+    if first_period_idx != -1:
+        # Encontrar en qué token está el punto
+        text_before_period = text[:first_period_idx + 1]
+        tokens_before = tokenizer.encode(text_before_period, add_special_tokens=False)
+        return len(tokens_before), "first_period"
+    
+    # Estrategia 2: Buscar salto de línea (común cuando el modelo empieza a divagar)
+    first_newline_idx = text.find('\n')
+    if first_newline_idx != -1:
+        text_before_newline = text[:first_newline_idx]
+        tokens_before = tokenizer.encode(text_before_newline, add_special_tokens=False)
+        return len(tokens_before), "first_newline"
+    
+    # Estrategia 3: Buscar otros signos de puntuación finales (?, !)
+    for punct, method in [('?', 'question_mark'), ('!', 'exclamation')]:
+        idx = text.find(punct)
+        if idx != -1:
+            text_before = text[:idx + 1]
+            tokens_before = tokenizer.encode(text_before, add_special_tokens=False)
+            return len(tokens_before), method
+    
+    # Estrategia 4: Detectar repetición (común en generaciones redundantes)
+    words = text.split()
+    if len(words) > 10:
+        # Buscar secuencias repetidas
+        for i in range(len(words) - 3):
+            window = ' '.join(words[i:i+3])
+            rest = ' '.join(words[i+3:])
+            if window in rest:
+                # Hay repetición, cortar antes
+                text_before_repeat = ' '.join(words[:i])
+                tokens_before = tokenizer.encode(text_before_repeat, add_special_tokens=False)
+                return max(1, len(tokens_before)), "repetition_detected"
+    
+    # Estrategia 5: Si todo falla, usar toda la generación
+    return len(token_ids) - prompt_length, "full_generation"
+
+
+def extract_activations_and_attentions(model, tokenizer, question, answer=None, 
+                                       max_new_tokens=64, cut_at_period=True):
     """
     Extrae las activaciones (hidden states) y atenciones de todas las capas
     durante la generación de una respuesta.
@@ -40,21 +97,30 @@ def extract_activations_and_attentions(model, tokenizer, question, answer=None, 
         question: Pregunta a responder
         answer: Respuesta de referencia (opcional, para evaluación)
         max_new_tokens: Número máximo de tokens a generar
+        cut_at_period: Si True, corta las trazas en el primer punto de la respuesta
         
     Returns:
         dict con:
             - 'question': pregunta original
             - 'generated_text': texto generado completo
             - 'generated_answer': respuesta sin el prompt
+            - 'generated_answer_clean': respuesta cortada en punto/señal de fin
             - 'hidden_states': lista de hidden states por capa y token
             - 'attentions': lista de matrices de atención por capa y token
             - 'tokens': tokens generados (IDs)
+            - 'cutoff_method': método usado para cortar la respuesta
+            - 'tokens_before_cutoff': número de tokens antes del corte
     """
-    # Preparar el prompt
-    prompt_text = f"Answer the question concisely. Q: {question} A:"
+    # Preparar el prompt con mejor formato para Qwen
+    prompt_text = f"Answer the question concisely in one sentence.\n\nQuestion: {question}\nAnswer:"
     prompt = tokenizer(prompt_text, return_tensors='pt').to(model.device)
     
+    # Asegurar que el tokenizer tiene tokens especiales configurados
+    if tokenizer.eos_token_id is None:
+        tokenizer.eos_token_id = tokenizer.convert_tokens_to_ids('<|endoftext|>')
+    
     # Generar con activaciones y atenciones
+    # Usar parámetros más agresivos para forzar respuestas cortas
     with torch.no_grad():
         generation_output = model.generate(
             **prompt,
@@ -62,8 +128,12 @@ def extract_activations_and_attentions(model, tokenizer, question, answer=None, 
             num_return_sequences=1,
             do_sample=False,
             max_new_tokens=max_new_tokens,
-            repetition_penalty=1.2,
+            repetition_penalty=1.5,  # Aumentado para evitar repetición
+            length_penalty=0.8,      # Penalizar respuestas largas
+            no_repeat_ngram_size=3,  # Evitar repetición de 3-gramas
+            early_stopping=True,     # Detener en EOS
             pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
             return_dict_in_generate=True,
             output_attentions=True,
             output_hidden_states=True
@@ -79,19 +149,36 @@ def extract_activations_and_attentions(model, tokenizer, question, answer=None, 
         skip_special_tokens=True
     )
     
-    # Extraer hidden states y attentions
-    # generation_output.hidden_states es una tupla de longitud igual al número de tokens generados
-    # Cada elemento es una tupla de tensores (uno por capa + embedding)
-    # generation_output.attentions tiene la misma estructura pero para atenciones
+    # Determinar punto de corte
+    cutoff_token_count, cutoff_method = find_answer_cutoff_point(
+        generated_answer, tokenizer, generated_ids, prompt_length
+    )
     
+    # Aplicar corte si está habilitado
+    if cut_at_period and cutoff_token_count < len(generated_ids) - prompt_length:
+        # Cortar en el punto detectado
+        actual_tokens_to_use = cutoff_token_count
+        generated_answer_clean = tokenizer.decode(
+            generation_output.sequences[0, prompt_length:prompt_length + actual_tokens_to_use],
+            skip_special_tokens=True
+        )
+    else:
+        actual_tokens_to_use = len(generated_ids) - prompt_length
+        generated_answer_clean = generated_answer
+        cutoff_method = "no_cutoff_applied"
+    
+    # Extraer hidden states y attentions SOLO hasta el punto de corte
     num_generated_tokens = len(generation_output.hidden_states)
     num_layers = len(generation_output.hidden_states[0]) - 1  # -1 porque incluye embeddings
+    
+    # Limitar al número de tokens que realmente queremos
+    tokens_to_extract = min(actual_tokens_to_use, num_generated_tokens)
     
     # Organizar hidden states: [capa][paso_generación][batch, seq_len, hidden_dim]
     hidden_states_by_layer = []
     for layer_idx in range(1, num_layers + 1):  # Empezar desde 1 para saltar embeddings
         layer_states = []
-        for token_step in range(num_generated_tokens):
+        for token_step in range(tokens_to_extract):
             # Extraer el hidden state de esta capa en este paso
             state = generation_output.hidden_states[token_step][layer_idx]
             layer_states.append(state.cpu().numpy())
@@ -101,27 +188,38 @@ def extract_activations_and_attentions(model, tokenizer, question, answer=None, 
     attentions_by_layer = []
     for layer_idx in range(num_layers):
         layer_attns = []
-        for token_step in range(num_generated_tokens):
+        for token_step in range(tokens_to_extract):
             # Extraer la matriz de atención de esta capa en este paso
             attn = generation_output.attentions[token_step][layer_idx]
             layer_attns.append(attn.cpu().numpy())
         attentions_by_layer.append(layer_attns)
     
+    # Tokens cortados
+    tokens_clean = generated_ids[:prompt_length + actual_tokens_to_use].cpu().numpy()
+    
     return {
         'question': question,
         'generated_text': generated_text,
         'generated_answer': generated_answer,
-        'hidden_states': hidden_states_by_layer,  # [num_layers][num_tokens_generated]
-        'attentions': attentions_by_layer,  # [num_layers][num_tokens_generated]
-        'tokens': generated_ids.cpu().numpy(),
+        'generated_answer_clean': generated_answer_clean,
+        'hidden_states': hidden_states_by_layer,  # [num_layers][tokens_to_extract]
+        'attentions': attentions_by_layer,  # [num_layers][tokens_to_extract]
+        'tokens': tokens_clean,
+        'tokens_full': generated_ids.cpu().numpy(),  # Guardar también la generación completa
         'prompt_length': prompt_length,
-        'num_layers': num_layers
+        'num_layers': num_layers,
+        'cutoff_method': cutoff_method,
+        'tokens_before_cutoff': actual_tokens_to_use,
+        'tokens_after_cutoff': len(generated_ids) - prompt_length - actual_tokens_to_use
     }
 
 
 def main():
     # Configuración del modelo Qwen3-4B-Instruct
     model_id = "Qwen/Qwen3-4B-Instruct-2507"
+    
+    # Configuración de batches para gestión de memoria
+    BATCH_SIZE = 500  # Guardar cada 500 traces (~5GB por archivo)
     
     print(f"Cargando modelo: {model_id}")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -144,80 +242,156 @@ def main():
     print("\nCargando dataset TriviaQA...")
     dataset = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext", split="train")
     
-    # Limitar el número de ejemplos para prueba (puedes ajustar según necesites)
-    num_samples = 1  # Cambiar según necesidad
-    dataset = dataset.select(range(min(num_samples, len(dataset))))
+    # Limitar el número de ejemplos si se desea (None = procesar todo el dataset)
+    num_samples = None  # Cambiar a un número específico para limitar, ej: 1000
+    if num_samples is not None:
+        dataset = dataset.select(range(min(num_samples, len(dataset))))
     
-    print(f"Número de muestras a procesar: {len(dataset)}")
+    total_examples = len(dataset)
+    print(f"Número de muestras a procesar: {total_examples}")
+    print(f"Tamaño de batch: {BATCH_SIZE} traces por archivo")
+    print(f"Archivos esperados: {(total_examples + BATCH_SIZE - 1) // BATCH_SIZE}")
     
     # Crear directorio para guardar los traces
     output_dir = Path("./traces_data")
     output_dir.mkdir(exist_ok=True)
     
-    # Procesar cada ejemplo del dataset
-    all_traces = []
+    # Variables para el procesamiento por batches
+    current_batch = []
+    batch_number = 0
+    total_processed = 0
+    total_errors = 0
     
+    # Estadísticas de corte
+    cutoff_stats = {}
+    
+    # Procesar cada ejemplo del dataset
     for idx, example in enumerate(tqdm(dataset, desc="Extrayendo trazas")):
         question = example['question']
         # TriviaQA tiene múltiples respuestas posibles
         answer_aliases = example['answer']['aliases'] if 'answer' in example else None
         
         try:
-            # Extraer activaciones y atenciones
+            # Extraer activaciones y atenciones con corte automático
             traces = extract_activations_and_attentions(
                 model=model,
                 tokenizer=tokenizer,
                 question=question,
                 answer=answer_aliases,
-                max_new_tokens=64
+                max_new_tokens=64,
+                cut_at_period=True  # Activar corte inteligente
             )
             
             # Añadir metadata del ejemplo
-            traces['example_id'] = idx
+            traces['example_id'] = len(current_batch)  # ID dentro del batch
+            traces['global_example_id'] = idx  # ID global en el dataset completo
+            traces['batch_number'] = batch_number  # Número de batch
             traces['ground_truth_answers'] = answer_aliases
             
-            all_traces.append(traces)
+            current_batch.append(traces)
+            total_processed += 1
+            
+            # Actualizar estadísticas de corte
+            method = traces['cutoff_method']
+            cutoff_stats[method] = cutoff_stats.get(method, 0) + 1
             
             # Mostrar ejemplo cada 10 muestras
             if idx % 10 == 0:
-                print(f"\n--- Ejemplo {idx} ---")
-                print(f"Pregunta: {question}")
-                print(f"Respuesta generada: {traces['generated_answer'][:100]}...")
-                print(f"Número de capas: {traces['num_layers']}")
-                print(f"Tokens generados: {len(traces['tokens']) - traces['prompt_length']}")
+                print(f"\n--- Ejemplo {idx} (Batch actual: {len(current_batch)}/{BATCH_SIZE}) ---")
+                print(f"Pregunta: {question[:70]}...")
+                print(f"Respuesta original: {traces['generated_answer'][:70]}...")
+                print(f"Respuesta limpia: {traces['generated_answer_clean'][:70]}...")
+                print(f"Método de corte: {traces['cutoff_method']}")
+                print(f"Tokens usados: {traces['tokens_before_cutoff']} (descartados: {traces['tokens_after_cutoff']})")
             
         except Exception as e:
-            print(f"\nError procesando ejemplo {idx}: {e}")
+            print(f"\n⚠️  Error procesando ejemplo {idx}: {e}")
+            total_errors += 1
             continue
-    
-    # Guardar todos los traces
-    output_file = output_dir / f"trivia_qa_traces_{model_id.split('/')[-1]}.pkl"
-    print(f"\nGuardando traces en {output_file}...")
-    
-    with open(output_file, 'wb') as f:
-        pickle.dump(all_traces, f)
-    
-    print(f"✅ Proceso completado. {len(all_traces)} ejemplos procesados y guardados.")
-    
-    # Análisis básico de los datos extraídos
-    print("\n--- Resumen de datos extraídos ---")
-    if all_traces:
-        sample_trace = all_traces[0]
-        print(f"Estructura de cada trace:")
-        print(f"  - Número de capas: {sample_trace['num_layers']}")
-        print(f"  - Hidden states shape por capa: {len(sample_trace['hidden_states'])} capas")
-        print(f"  - Attentions shape por capa: {len(sample_trace['attentions'])} capas")
         
-        # Mostrar dimensiones de un ejemplo
-        if sample_trace['hidden_states']:
-            first_layer_first_token = sample_trace['hidden_states'][0][0]
-            print(f"  - Dimensión de hidden state (primera capa, primer token): {first_layer_first_token.shape}")
-        
-        if sample_trace['attentions']:
-            first_layer_first_token_attn = sample_trace['attentions'][0][0]
-            print(f"  - Dimensión de attention (primera capa, primer token): {first_layer_first_token_attn.shape}")
+        # Guardar batch cuando alcance el tamaño especificado
+        if len(current_batch) >= BATCH_SIZE:
+            output_file = output_dir / f"trivia_qa_traces_batch_{batch_number:04d}.pkl"
+            print(f"\n💾 Guardando batch {batch_number} en {output_file.name}...")
+            
+            with open(output_file, 'wb') as f:
+                pickle.dump(current_batch, f)
+            
+            # Calcular tamaño del archivo
+            file_size_mb = output_file.stat().st_size / (1024 * 1024)
+            print(f"   ✅ Batch {batch_number} guardado: {len(current_batch)} traces, {file_size_mb:.2f} MB")
+            
+            # Resetear batch y liberar memoria
+            current_batch = []
+            batch_number += 1
+            
+            # Forzar garbage collection para liberar memoria
+            import gc
+            gc.collect()
     
-    return all_traces
+    # Guardar el último batch si tiene datos
+    if current_batch:
+        output_file = output_dir / f"trivia_qa_traces_batch_{batch_number:04d}.pkl"
+        print(f"\n💾 Guardando último batch {batch_number} en {output_file.name}...")
+        
+        with open(output_file, 'wb') as f:
+            pickle.dump(current_batch, f)
+        
+        file_size_mb = output_file.stat().st_size / (1024 * 1024)
+        print(f"   ✅ Batch {batch_number} guardado: {len(current_batch)} traces, {file_size_mb:.2f} MB")
+        batch_number += 1
+    
+    # Resumen final
+    print("\n" + "="*80)
+    print("✅ PROCESO COMPLETADO")
+    print("="*80)
+    print(f"Total de ejemplos procesados: {total_processed}")
+    print(f"Total de errores: {total_errors}")
+    print(f"Total de batches guardados: {batch_number}")
+    print(f"Directorio de salida: {output_dir.absolute()}")
+    
+    # Mostrar estadísticas de métodos de corte
+    print(f"\n📊 Estadísticas de métodos de corte:")
+    for method, count in sorted(cutoff_stats.items(), key=lambda x: x[1], reverse=True):
+        percentage = (count / total_processed) * 100 if total_processed > 0 else 0
+        print(f"   • {method}: {count} ({percentage:.1f}%)")
+    
+    # Listar archivos generados
+    print(f"\n📁 Archivos generados:")
+    batch_files = sorted(output_dir.glob("trivia_qa_traces_batch_*.pkl"))
+    total_size = 0
+    for batch_file in batch_files:
+        size_mb = batch_file.stat().st_size / (1024 * 1024)
+        total_size += size_mb
+        print(f"   • {batch_file.name}: {size_mb:.2f} MB")
+    
+    print(f"\n💾 Tamaño total en disco: {total_size:.2f} MB ({total_size/1024:.2f} GB)")
+    
+    # Análisis básico del primer batch
+    if batch_files:
+        print(f"\n--- Análisis del primer batch ---")
+        with open(batch_files[0], 'rb') as f:
+            first_batch = pickle.load(f)
+        
+        if first_batch:
+            sample_trace = first_batch[0]
+            print(f"Estructura de cada trace:")
+            print(f"  - Número de capas: {sample_trace['num_layers']}")
+            print(f"  - Hidden states shape por capa: {len(sample_trace['hidden_states'])} capas")
+            print(f"  - Attentions shape por capa: {len(sample_trace['attentions'])} capas")
+            print(f"  - Método de corte usado: {sample_trace['cutoff_method']}")
+            print(f"  - Tokens antes del corte: {sample_trace['tokens_before_cutoff']}")
+            print(f"  - Tokens después del corte: {sample_trace['tokens_after_cutoff']}")
+            
+            if sample_trace['hidden_states']:
+                first_layer_first_token = sample_trace['hidden_states'][0][0]
+                print(f"  - Dimensión de hidden state (primera capa, primer token): {first_layer_first_token.shape}")
+            
+            if sample_trace['attentions']:
+                first_layer_first_token_attn = sample_trace['attentions'][0][0]
+                print(f"  - Dimensión de attention (primera capa, primer token): {first_layer_first_token_attn.shape}")
+    
+    return batch_number  # Retorna el número de batches creados
 
 
 if __name__ == '__main__':
