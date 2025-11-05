@@ -240,6 +240,7 @@ def main():
     # Opciones:
     # - "meta-llama/Llama-2-7b-chat-hf" (recomendado para alucinaciones)
     # - "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit" (pre-cuantizado, pero rechaza muchas preguntas)
+    # agregando mini commit
     model_id = "meta-llama/Llama-2-7b-chat-hf"
 
     # Configuración de batches para gestión de memoria
