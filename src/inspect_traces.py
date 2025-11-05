@@ -138,8 +138,11 @@ def main():
     dataset_name = None
     if any('triviaqa' in f.name.lower() for f in all_files):
         dataset_name = 'triviaqa'
+        
     elif any('truthfulqa' in f.name.lower() for f in all_files):
         dataset_name = 'truthfulqa'
+    
+    print(f'Se ha identificado el dataset: {dataset_name}')
     
     # Intentar cargar dataset para recuperar información
     dataset = None
@@ -149,7 +152,7 @@ def main():
             print(f"Cargando {dataset_name} para recuperar preguntas y respuestas...")
             
             if dataset_name == 'triviaqa':
-                dataset = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext", split="train")
+                dataset = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext", split="validation")
             elif dataset_name == 'truthfulqa':
                 dataset = load_dataset("truthful_qa", "generation", split="validation")
             
@@ -206,7 +209,7 @@ def main():
             
             # Mostrar 5 ejemplos de este batch
             print(f"\n   --- 5 Ejemplos del batch {batch_idx} ---")
-            for i in range(min(5, len(traces))):
+            for i in range(min(20, len(traces))):
                 trace = traces[i]
                 question_id = trace.get('question_id', 'N/A')
                 num_tokens = len(trace['tokens'])
@@ -218,24 +221,27 @@ def main():
                         if dataset_name == 'triviaqa':
                             # Buscar por question_id
                             example = next((ex for ex in dataset if ex['question_id'] == question_id), None)
+                            answer = example['answer']['normalized_aliases'][:3]
                         elif dataset_name == 'truthfulqa':
                             # Extraer índice del question_id (formato: truthfulqa_123)
                             if question_id.startswith('truthfulqa_'):
                                 idx = int(question_id.split('_')[1])
                                 example = dataset[idx]
+                                answer = None
                             else:
                                 example = None
                         else:
                             example = None
                         
                         if example:
-                            question_text = example['question'][:60] + "..."
+                            question_text = example['question'] 
                     except:
                         pass
                 
                 print(f"\n   {i+1}. Question ID: {question_id}")
                 print(f"      Pregunta: {question_text}")
-                print(f"      Respuesta: {trace['generated_answer_clean'][:60]}...")
+                print(f"      Respuesta: {trace['generated_answer_clean']}")
+                print(f"      Ground Truth: {answer}")
                 print(f"      Tokens: {num_tokens}")
                 if 'tokens_decoded' in trace:
                     print(f"      Decodificados: {trace['tokens_decoded'][:3]}...")

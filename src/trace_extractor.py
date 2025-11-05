@@ -227,8 +227,8 @@ def extract_activations_and_attentions(model, tokenizer, question, max_new_token
     }
 
 HF_NAMES = {
-    'qwen_2.5_6B' : '__'
-    'llama2_chat_7B': 'models/Llama-2-7b-chat-hf',
+    'qwen_2.5_6B' : '__',
+    'llama2_chat_7B': 'meta-llama/Llama-2-7b-chat-hf',
 }
 
 
@@ -253,7 +253,7 @@ def main(args):
         print("✅ Modelo pre-cuantizado detectado, cargando directamente...")
         # Para modelos pre-cuantizados de Unsloth, NO usar quantization_config
         model = AutoModelForCausalLM.from_pretrained(
-            args.model_id,
+            model_load,
             attn_implementation="eager",  # Necesario para extraer atenciones
             device_map="auto",
             trust_remote_code=True
@@ -267,11 +267,11 @@ def main(args):
             bnb_4bit_quant_type="nf4"             # Tipo de cuantización: NormalFloat4 (óptimo)
         )
         model = AutoModelForCausalLM.from_pretrained(
-            args.model_id,
+            model_load,
             attn_implementation="eager",  # Necesario para extraer atenciones
             quantization_config=bnb_config,
             device_map="auto",            # Distribución automática en GPU
-            torch_dtype=torch.float16     # Tipo de dato base
+            dtype=torch.float16     # Tipo de dato base
         )
     
     num_layers = len(model.model.layers)
@@ -436,8 +436,8 @@ if __name__ == '__main__':
     parser.add_argument(
         '--model',
         type=str,
-        default="meta-llama/Llama-2-7b-chat-hf",
-        help='ID del modelo de HuggingFace (default: meta-llama/Llama-2-7b-chat-hf)'
+        default="llama2_chat_7B",
+        help='ID del modelo de HuggingFace (default: llama2_chat_7B)'
     )
     
     parser.add_argument(
