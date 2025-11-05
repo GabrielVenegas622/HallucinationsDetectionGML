@@ -293,8 +293,8 @@ def main():
             if idx % 10 == 0:
                 print(f"\n--- Ejemplo {idx} (Batch actual: {len(current_batch)}/{BATCH_SIZE}) ---")
                 print(f"Question ID: {question_id}")
-                print(f"Pregunta: {question[:70]}...")
-                print(f"Respuesta limpia: {traces['generated_answer_clean'][:70]}...")
+                print(f"Pregunta: {question}...")
+                print(f"Respuesta limpia: {traces['generated_answer_clean']}...")
                 print(f"Tokens generados: {num_tokens}")
                 print(f"Tokens decodificados: {traces['tokens_decoded'][:5]}...")  # Primeros 5 tokens
             
