@@ -111,8 +111,17 @@ def extract_activations_and_attentions(model, tokenizer, question, answer=None,
             - 'cutoff_method': método usado para cortar la respuesta
             - 'tokens_before_cutoff': número de tokens antes del corte
     """
-    # Preparar el prompt con mejor formato para Qwen
-    prompt_text = f"Answer the question concisely in one sentence.\n\nQuestion: {question}\nAnswer:"
+    # Preparar el prompt (compatible con Qwen y Llama)
+    # Para Llama, usar formato de chat si el tokenizer lo soporta
+    if hasattr(tokenizer, 'apply_chat_template') and 'llama' in tokenizer.name_or_path.lower():
+        messages = [
+            {"role": "user", "content": f"Answer the following question concisely in one sentence:\n\n{question}"}
+        ]
+        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    else:
+        # Formato genérico para Qwen y otros
+        prompt_text = f"Answer the question concisely in one sentence.\n\nQuestion: {question}\nAnswer:"
+    
     prompt = tokenizer(prompt_text, return_tensors='pt').to(model.device)
     
     # Asegurar que el tokenizer tiene tokens especiales configurados
@@ -213,25 +222,42 @@ def extract_activations_and_attentions(model, tokenizer, question, answer=None,
 
 
 def main():
-    # Configuración del modelo Qwen3-4B-Instruct
-    model_id = "Qwen/Qwen3-4B-Instruct-2507"
+    # Configuración del modelo
+    # Opciones:
+    # - "Qwen/Qwen3-4B-Instruct-2507" (requiere cuantización)
+    # - "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit" (ya cuantizado a 4-bit)
+    model_id = "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
     
     # Configuración de batches para gestión de memoria
     BATCH_SIZE = 500
     
     print(f"Cargando modelo: {model_id}")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_8bit=True
-    )
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        attn_implementation="eager",  # Necesario para extraer atenciones
-        quantization_config=bnb_config,
-        device_map="auto"
-    )
+    
+    # Detectar si el modelo ya está cuantizado (bnb-4bit o bnb-8bit en el nombre)
+    is_prequantized = "bnb-4bit" in model_id.lower() or "bnb-8bit" in model_id.lower()
+    
+    if is_prequantized:
+        print("✅ Modelo pre-cuantizado detectado, cargando directamente...")
+        # Para modelos pre-cuantizados de Unsloth, NO usar quantization_config
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            attn_implementation="eager",  # Necesario para extraer atenciones
+            device_map="auto",
+            trust_remote_code=True
+        )
+    else:
+        print("⚙️  Aplicando cuantización de 8-bit...")
+        # Para modelos normales, aplicar cuantización
+        bnb_config = BitsAndBytesConfig(
+            load_in_8bit=True
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            attn_implementation="eager",  # Necesario para extraer atenciones
+            quantization_config=bnb_config,
+            device_map="auto"
+        )
     
     num_layers = len(model.model.layers)
     print(f"Número de capas del modelo: {num_layers}")
