@@ -238,10 +238,10 @@ def extract_activations_and_attentions(model, tokenizer, question, answer=None,
 def main():
     # Configuración del modelo
     # Opciones:
-    # - "Qwen/Qwen3-4B-Instruct-2507" (requiere cuantización)
-    # - "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit" (ya cuantizado a 4-bit)
-    model_id = "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
-    
+    # - "meta-llama/Llama-2-7b-chat-hf" (recomendado para alucinaciones)
+    # - "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit" (pre-cuantizado, pero rechaza muchas preguntas)
+    model_id = "meta-llama/Llama-2-7b-chat-hf"
+
     # Configuración de batches para gestión de memoria
     BATCH_SIZE = 500
     
@@ -261,16 +261,19 @@ def main():
             trust_remote_code=True
         )
     else:
-        print("⚙️  Aplicando cuantización de 8-bit...")
-        # Para modelos normales, aplicar cuantización
+        print("⚙️  Aplicando cuantización de 4-bit con BitsAndBytes...")
+        # Configuración óptima de cuantización 4-bit para RTX 4060 8GB
         bnb_config = BitsAndBytesConfig(
-            load_in_8bit=True
+            load_in_4bit=True,                    # Cuantización a 4 bits
+            bnb_4bit_compute_dtype=torch.float16, # Tipo de dato para cálculos
+            bnb_4bit_quant_type="nf4"             # Tipo de cuantización: NormalFloat4 (óptimo)
         )
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             attn_implementation="eager",  # Necesario para extraer atenciones
             quantization_config=bnb_config,
-            device_map="auto"
+            device_map="auto",            # Distribución automática en GPU
+            torch_dtype=torch.float16     # Tipo de dato base
         )
     
     num_layers = len(model.model.layers)
