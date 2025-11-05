@@ -194,18 +194,22 @@ def extract_activations_and_attentions(model, tokenizer, question, answer=None,
             layer_attns.append(attn.cpu().numpy())
         attentions_by_layer.append(layer_attns)
     
-    # Tokens cortados
-    tokens_clean = generated_ids[:prompt_length + actual_tokens_to_use].cpu().numpy()
+    # Tokens cortados (solo la parte generada, sin prompt)
+    generated_tokens_clean = generation_output.sequences[0, prompt_length:prompt_length + actual_tokens_to_use].cpu().numpy()
+    
+    # Decodificar cada token individualmente para visualización
+    tokens_decoded = []
+    for token_id in generated_tokens_clean:
+        token_text = tokenizer.decode([token_id], skip_special_tokens=False)
+        tokens_decoded.append(token_text)
     
     return {
         'question': question,
-        'generated_text': generated_text,
-        'generated_answer': generated_answer,
-        'generated_answer_clean': generated_answer_clean,
+        'generated_answer_clean': generated_answer_clean,  # Solo la respuesta limpia
         'hidden_states': hidden_states_by_layer,  # [num_layers][tokens_to_extract]
         'attentions': attentions_by_layer,  # [num_layers][tokens_to_extract]
-        'tokens': tokens_clean,
-        'tokens_full': generated_ids.cpu().numpy(),  # Guardar también la generación completa
+        'tokens': generated_tokens_clean,  # IDs de tokens (solo respuesta, sin prompt)
+        'tokens_decoded': tokens_decoded,  # Textos de tokens decodificados
         'prompt_length': prompt_length,
         'num_layers': num_layers,
         'cutoff_method': cutoff_method,
@@ -299,10 +303,10 @@ def main():
             if idx % 10 == 0:
                 print(f"\n--- Ejemplo {idx} (Batch actual: {len(current_batch)}/{BATCH_SIZE}) ---")
                 print(f"Pregunta: {question[:70]}...")
-                print(f"Respuesta original: {traces['generated_answer'][:70]}...")
                 print(f"Respuesta limpia: {traces['generated_answer_clean'][:70]}...")
                 print(f"Método de corte: {traces['cutoff_method']}")
                 print(f"Tokens usados: {traces['tokens_before_cutoff']} (descartados: {traces['tokens_after_cutoff']})")
+                print(f"Tokens decodificados: {traces['tokens_decoded'][:5]}...")  # Primeros 5 tokens
             
         except Exception as e:
             print(f"\n⚠️  Error procesando ejemplo {idx}: {e}")
