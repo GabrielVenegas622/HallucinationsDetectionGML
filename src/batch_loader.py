@@ -233,7 +233,7 @@ def main():
             print(f"  Global ID: {trace.get('global_example_id', 'N/A')}")
             print(f"  Batch: {trace.get('batch_number', 'N/A')}")
             print(f"  Pregunta: {trace['question'][:60]}...")
-            print(f"  Respuesta: {trace['generated_answer'][:60]}...")
+            print(f"  Respuesta: {trace['generated_answer_clean'][:60]}...")
         
         # Ejemplo: Cargar un batch específico
         print(f"\n{'='*80}")

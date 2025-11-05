@@ -23,20 +23,26 @@ def analyze_trace(trace, trace_idx=0):
     
     # Información básica
     print(f"\n📝 Pregunta: {trace['question']}")
-    print(f"\n💬 Respuesta Generada: {trace['generated_answer']}")
+    print(f"\n💬 Respuesta Limpia: {trace['generated_answer_clean']}")
     
-    if trace['ground_truth_answers']:
+    if trace.get('ground_truth_answers'):
         print(f"\n✅ Respuestas Correctas:")
         for i, ans in enumerate(trace['ground_truth_answers'][:3], 1):
             print(f"   {i}. {ans}")
     
     # Información de tokens
-    num_tokens_total = len(trace['tokens'])
-    num_tokens_generated = num_tokens_total - trace['prompt_length']
+    num_tokens_generated = len(trace['tokens'])  # Ahora tokens solo contiene la respuesta
     print(f"\n🔢 Tokens:")
-    print(f"   - Total: {num_tokens_total}")
-    print(f"   - Prompt: {trace['prompt_length']}")
-    print(f"   - Generados: {num_tokens_generated}")
+    print(f"   - Tokens en respuesta limpia: {num_tokens_generated}")
+    print(f"   - Tokens antes del corte: {trace.get('tokens_before_cutoff', num_tokens_generated)}")
+    print(f"   - Tokens descartados: {trace.get('tokens_after_cutoff', 0)}")
+    print(f"   - Método de corte: {trace.get('cutoff_method', 'N/A')}")
+    
+    # Mostrar tokens decodificados si están disponibles
+    if 'tokens_decoded' in trace:
+        print(f"\n📝 Tokens decodificados (primeros 10):")
+        for i, token_text in enumerate(trace['tokens_decoded'][:10]):
+            print(f"   {i}: '{token_text}'")
     
     # Información de capas
     num_layers = trace['num_layers']
@@ -89,16 +95,30 @@ def analyze_dataset_statistics(traces):
     
     # Longitudes de respuestas
     answer_lengths = []
-    for trace in traces:
-        num_generated = len(trace['tokens']) - trace['prompt_length']
-        answer_lengths.append(num_generated)
+    cutoff_methods = {}
     
-    print(f"\n📏 Longitud de respuestas generadas:")
+    for trace in traces:
+        # Ahora tokens solo contiene la respuesta limpia
+        num_generated = len(trace['tokens'])
+        answer_lengths.append(num_generated)
+        
+        # Recopilar métodos de corte
+        method = trace.get('cutoff_method', 'unknown')
+        cutoff_methods[method] = cutoff_methods.get(method, 0) + 1
+    
+    print(f"\n📏 Longitud de respuestas limpias:")
     print(f"   - Media: {np.mean(answer_lengths):.2f} tokens")
     print(f"   - Mediana: {np.median(answer_lengths):.2f} tokens")
     print(f"   - Min: {np.min(answer_lengths)} tokens")
     print(f"   - Max: {np.max(answer_lengths)} tokens")
     print(f"   - Std: {np.std(answer_lengths):.2f} tokens")
+    
+    # Mostrar métodos de corte
+    if cutoff_methods:
+        print(f"\n✂️  Métodos de corte utilizados:")
+        for method, count in sorted(cutoff_methods.items(), key=lambda x: x[1], reverse=True):
+            percentage = (count / num_traces) * 100
+            print(f"   • {method}: {count} ({percentage:.1f}%)")
     
     # Verificar consistencia
     num_layers_list = [trace['num_layers'] for trace in traces]
@@ -157,6 +177,7 @@ def main():
         
         all_traces_count = 0
         answer_lengths = []
+        cutoff_methods = {}
         
         # Analizar cada batch
         for batch_idx, batch_file in enumerate(batch_files):
@@ -173,8 +194,12 @@ def main():
                 
                 # Recopilar estadísticas
                 for trace in traces:
-                    num_generated = len(trace['tokens']) - trace['prompt_length']
+                    num_generated = len(trace['tokens'])  # Ahora solo contiene respuesta
                     answer_lengths.append(num_generated)
+                    
+                    # Métodos de corte
+                    method = trace.get('cutoff_method', 'unknown')
+                    cutoff_methods[method] = cutoff_methods.get(method, 0) + 1
                 
                 # Mostrar ejemplo del primer batch
                 if batch_idx == 0 and traces:
@@ -191,12 +216,19 @@ def main():
         print(f"📊 Total de traces en todos los batches: {all_traces_count}")
         
         if answer_lengths:
-            print(f"\n📏 Longitud de respuestas generadas:")
+            print(f"\n📏 Longitud de respuestas limpias:")
             print(f"   - Media: {np.mean(answer_lengths):.2f} tokens")
             print(f"   - Mediana: {np.median(answer_lengths):.2f} tokens")
             print(f"   - Min: {np.min(answer_lengths)} tokens")
             print(f"   - Max: {np.max(answer_lengths)} tokens")
             print(f"   - Std: {np.std(answer_lengths):.2f} tokens")
+        
+        # Mostrar métodos de corte
+        if cutoff_methods:
+            print(f"\n✂️  Métodos de corte utilizados:")
+            for method, count in sorted(cutoff_methods.items(), key=lambda x: x[1], reverse=True):
+                percentage = (count / all_traces_count) * 100 if all_traces_count > 0 else 0
+                print(f"   • {method}: {count} ({percentage:.1f}%)")
         
         # Mostrar algunos ejemplos de diferentes batches
         print(f"\n{'='*80}")
@@ -210,12 +242,15 @@ def main():
                     traces = pickle.load(f)
                 if traces:
                     trace = traces[0]
-                    num_gen = len(trace['tokens']) - trace['prompt_length']
+                    num_gen = len(trace['tokens'])  # Solo respuesta
                     print(f"  Q: {trace['question'][:60]}...")
-                    print(f"  A: {trace['generated_answer'][:60]}...")
+                    print(f"  A: {trace['generated_answer_clean'][:60]}...")
                     print(f"  Tokens generados: {num_gen}")
+                    print(f"  Método de corte: {trace.get('cutoff_method', 'N/A')}")
                     print(f"  Batch number: {trace.get('batch_number', 'N/A')}")
                     print(f"  Global ID: {trace.get('global_example_id', 'N/A')}")
+                    if 'tokens_decoded' in trace:
+                        print(f"  Tokens: {trace['tokens_decoded'][:5]}...")
         
     # Si hay archivos antiguos, también analizarlos
     elif old_files:

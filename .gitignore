@@ -1,6 +1,4 @@
 llama_token.txt
 help.md
 data/
-requirements.txt
-QUICKSTART.md
-CAMBIOS_IMPLEMENTADOS.md
+ignore/
