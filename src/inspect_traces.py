@@ -42,14 +42,18 @@ def analyze_trace(trace, trace_idx=0, dataset=None):
     print(f"\n💬 Respuesta Generada: {trace['generated_answer_clean']}")
     
     # Información de tokens
-    num_tokens_generated = len(trace['tokens'])
+    num_tokens_total = len(trace['tokens'])
     print(f"\n🔢 Tokens:")
-    print(f"   - Tokens en respuesta: {num_tokens_generated}")
+    print(f"   - Tokens totales (prompt + respuesta): {num_tokens_total}")
     
     # Mostrar tokens decodificados si están disponibles
     if 'tokens_decoded' in trace:
-        print(f"\n📝 Tokens decodificados:")
+        print(f"\n📝 Tokens decodificados (primeros 10 y últimos 10):")
         for i, token_text in enumerate(trace['tokens_decoded'][:10]):
+            print(f"   {i}: '{token_text}'")
+        print(f"   ...")
+        start_last = max(0, len(trace['tokens_decoded']) - 10)
+        for i, token_text in enumerate(trace['tokens_decoded'][start_last:], start=start_last):
             print(f"   {i}: '{token_text}'")
     
     # Información de capas
@@ -97,20 +101,20 @@ def analyze_dataset_statistics(traces):
     num_traces = len(traces)
     print(f"\n📊 Tamaño del dataset: {num_traces} ejemplos")
     
-    # Longitudes de respuestas
-    answer_lengths = []
+    # Longitudes de secuencias completas
+    sequence_lengths = []
     
     for trace in traces:
-        # Tokens solo contiene la respuesta limpia
-        num_generated = len(trace['tokens'])
-        answer_lengths.append(num_generated)
+        # Tokens ahora contiene toda la secuencia (prompt + respuesta)
+        num_total = len(trace['tokens'])
+        sequence_lengths.append(num_total)
     
-    print(f"\n📏 Longitud de respuestas limpias:")
-    print(f"   - Media: {np.mean(answer_lengths):.2f} tokens")
-    print(f"   - Mediana: {np.median(answer_lengths):.2f} tokens")
-    print(f"   - Min: {np.min(answer_lengths)} tokens")
-    print(f"   - Max: {np.max(answer_lengths)} tokens")
-    print(f"   - Std: {np.std(answer_lengths):.2f} tokens")
+    print(f"\n📏 Longitud de secuencias completas (prompt + respuesta):")
+    print(f"   - Media: {np.mean(sequence_lengths):.2f} tokens")
+    print(f"   - Mediana: {np.median(sequence_lengths):.2f} tokens")
+    print(f"   - Min: {np.min(sequence_lengths)} tokens")
+    print(f"   - Max: {np.max(sequence_lengths)} tokens")
+    print(f"   - Std: {np.std(sequence_lengths):.2f} tokens")
     
     # Verificar consistencia de capas
     num_layers_list = [len(trace['hidden_states']) for trace in traces]
@@ -204,47 +208,49 @@ def main():
             
             # Recopilar estadísticas
             for trace in traces:
-                num_generated = len(trace['tokens'])  # Ahora solo contiene respuesta
-                answer_lengths.append(num_generated)
+                num_total = len(trace['tokens'])  # Ahora contiene toda la secuencia
+                answer_lengths.append(num_total)
             
             # Mostrar 5 ejemplos de este batch
             print(f"\n   --- 5 Ejemplos del batch {batch_idx} ---")
-            for i in range(min(20, len(traces))):
+            for i in range(min(5, len(traces))):
                 trace = traces[i]
                 question_id = trace.get('question_id', 'N/A')
                 num_tokens = len(trace['tokens'])
                 
                 # Intentar recuperar pregunta del dataset
                 question_text = "N/A"
+                answer = "N/A"
                 if dataset is not None:
                     try:
                         if dataset_name == 'triviaqa':
                             # Buscar por question_id
                             example = next((ex for ex in dataset if ex['question_id'] == question_id), None)
-                            answer = example['answer']['normalized_aliases'][:3]
+                            if example:
+                                question_text = example['question']
+                                answer = example['answer']['normalized_aliases'][:3]
                         elif dataset_name == 'truthfulqa':
                             # Extraer índice del question_id (formato: truthfulqa_123)
                             if question_id.startswith('truthfulqa_'):
                                 idx = int(question_id.split('_')[1])
                                 example = dataset[idx]
-                                answer = None
+                                question_text = example['question']
+                                answer = example.get('best_answer', 'N/A')
                             else:
                                 example = None
                         else:
                             example = None
-                        
-                        if example:
-                            question_text = example['question'] 
                     except:
                         pass
                 
                 print(f"\n   {i+1}. Question ID: {question_id}")
-                print(f"      Pregunta: {question_text}")
-                print(f"      Respuesta: {trace['generated_answer_clean']}")
+                print(f"      Pregunta: {question_text[:100]}...")
+                print(f"      Respuesta: {trace['generated_answer_clean'][:100]}...")
                 print(f"      Ground Truth: {answer}")
-                print(f"      Tokens: {num_tokens}")
+                print(f"      Tokens totales (prompt + respuesta): {num_tokens}")
                 if 'tokens_decoded' in trace:
-                    print(f"      Decodificados: {trace['tokens_decoded'][:3]}...")
+                    print(f"      Primeros tokens: {trace['tokens_decoded'][:3]}")
+                    print(f"      Últimos tokens: {trace['tokens_decoded'][-3:]}")
             
             # Solo mostrar detalle completo del primer ejemplo del primer batch
             if batch_idx == 0 and traces:
@@ -266,7 +272,7 @@ def main():
     print(f"📊 Total de traces en todos los batches: {all_traces_count}")
     
     if answer_lengths:
-        print(f"\n📏 Longitud de respuestas limpias:")
+        print(f"\n📏 Longitud de secuencias completas (prompt + respuesta):")
         print(f"   - Media: {np.mean(answer_lengths):.2f} tokens")
         print(f"   - Mediana: {np.median(answer_lengths):.2f} tokens")
         print(f"   - Min: {np.min(answer_lengths)} tokens")

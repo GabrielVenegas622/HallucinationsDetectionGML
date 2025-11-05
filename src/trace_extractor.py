@@ -34,25 +34,38 @@ def extract_activations_and_attentions(model, tokenizer, question, max_new_token
     Extrae las activaciones (hidden states) y atenciones del estado final
     de la generación (después de generar todos los tokens).
     
+    Este método realiza una "foto final" del estado completo del modelo después
+    de generar toda la respuesta. Captura activaciones y atenciones para TODA
+    la secuencia (prompt + respuesta generada), lo cual es esencial para:
+    
+    1. Analizar las atenciones que la respuesta presta al prompt (contexto)
+    2. Construir un grafo completo de dependencias entre todos los tokens
+    3. Detectar patrones de alucinación considerando la interacción prompt-respuesta
+    
+    IMPORTANTE: Solo se realiza UN forward pass al final, capturando el estado
+    completo de toda la secuencia. No se guardan estados intermedios de cada
+    paso de generación.
+    
     Args:
         model: Modelo de lenguaje cargado
         tokenizer: Tokenizer correspondiente al modelo
         question: Pregunta a responder
-        answer: Respuesta de referencia (opcional, para evaluación)
         max_new_tokens: Número máximo de tokens a generar
-        cut_at_period: Si True, corta las trazas en el primer punto de la respuesta
         
     Returns:
         dict con:
-            - 'generated_answer_clean': respuesta cortada en punto/señal de fin
-            - 'hidden_states': lista de arrays por capa [seq_len_total, hidden_dim]
-            - 'attentions': lista de arrays por capa [num_heads, seq_len_total, seq_len_total]
-            - 'tokens': tokens generados (IDs)
-            - 'tokens_decoded': tokens como strings
-            
-        donde seq_len_total = len(prompt) + len(respuesta_generada_limpia)
+            - 'generated_answer_clean': respuesta completa generada (str)
+            - 'hidden_states': lista de arrays por capa, cada uno con shape 
+                               [seq_len_total, hidden_dim], donde seq_len_total 
+                               incluye tokens de prompt + respuesta
+            - 'attentions': lista de arrays por capa, cada uno con shape 
+                           [num_heads, seq_len_total, seq_len_total], matriz completa
+                           de atención que incluye interacciones prompt↔respuesta
+            - 'tokens': IDs de TODOS los tokens (prompt + respuesta), array completo
+            - 'tokens_decoded': lista de strings, cada token decodificado individualmente
+                               (prompt + respuesta), útil para visualización en grafos
     """
-    # Preparar el prompt (compatible con Qwen y Llama)
+    # Preparar el prompt (compatible con Llama)
     prompt_text = f"Answer the question concisely in one sentence.\n\nQuestion: {question}\nAnswer:"
     
     prompt = tokenizer(prompt_text, return_tensors='pt').to(model.device)
@@ -62,7 +75,6 @@ def extract_activations_and_attentions(model, tokenizer, question, max_new_token
         tokenizer.eos_token_id = tokenizer.convert_tokens_to_ids('<|endoftext|>')
     
     # Generar con activaciones y atenciones
-    # Usar parámetros más agresivos para forzar respuestas cortas
     with torch.no_grad():
         generation_output = model.generate(
             **prompt,
@@ -70,52 +82,47 @@ def extract_activations_and_attentions(model, tokenizer, question, max_new_token
             num_return_sequences=1,
             do_sample=False,
             max_new_tokens=max_new_tokens,
-
-            early_stopping=True,     # Detener en EOS
+            early_stopping=True,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
-
             return_dict_in_generate=True,
             output_attentions=True,
             output_hidden_states=True
         )
     
-    # Decodificar el texto generado
-    generated_ids = generation_output.sequences[0]
-    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-    
+    # Decodificar la respuesta completa (sin prompt, solo para guardar el texto)
     prompt_length = prompt["input_ids"].shape[-1]
-    generated_answer = tokenizer.decode(
+    generated_answer_clean = tokenizer.decode(
         generation_output.sequences[0, prompt_length:],
         skip_special_tokens=True
     )
     
-    actual_tokens_to_use = len(generated_ids) - prompt_length
-    generated_answer_clean = generated_answer
+    # Número de tokens realmente generados (sin prompt)
+    num_tokens_generated = generation_output.sequences.shape[-1] - prompt_length
     
     # Extraer hidden states y attentions del ESTADO FINAL (último paso de generación)
-    num_generated_tokens = len(generation_output.hidden_states)
+    num_generated_steps = len(generation_output.hidden_states)
     num_layers = len(generation_output.hidden_states[0]) - 1  # -1 porque incluye embeddings
     
-    # Limitar al número de tokens que realmente queremos
-    tokens_to_extract = min(actual_tokens_to_use, num_generated_tokens)
-    
     # Índice del último paso de generación
-    final_step_idx = tokens_to_extract - 1
+    final_step_idx = num_generated_steps - 1
     
-    # Longitud total de la secuencia (prompt + tokens generados)
-    seq_len_total = prompt_length + tokens_to_extract
+    # Longitud total de la secuencia (prompt + todos los tokens generados)
+    seq_len_total = prompt_length + num_tokens_generated
+    
+    # ========================================================================
+    # ESTADO FINAL: Foto completa de activaciones y atenciones
+    # ========================================================================
     
     # Organizar hidden states: [capa] -> array[seq_len_total, hidden_dim]
-    # Extraemos SOLO el último paso que contiene el estado completo
+    # Extraemos SOLO el último paso que contiene el estado completo de toda la secuencia
     hidden_states_by_layer = []
     for layer_idx in range(1, num_layers + 1):  # Empezar desde 1 para saltar embeddings
         # Estado final de esta capa (incluye prompt + todos los tokens generados)
         final_state = generation_output.hidden_states[final_step_idx][layer_idx]
-        # Cortar para incluir solo: prompt + tokens generados hasta el corte
         # Shape: [batch=1, seq_len, hidden_dim] -> [seq_len_total, hidden_dim]
-        final_state_cut = final_state[0, :seq_len_total, :].cpu().numpy()
-        hidden_states_by_layer.append(final_state_cut)
+        final_state_full = final_state[0, :seq_len_total, :].cpu().numpy()
+        hidden_states_by_layer.append(final_state_full)
     
     # Organizar attentions: [capa] -> array[num_heads, seq_len_total, seq_len_total]
     # Extraemos SOLO el último paso que contiene la matriz de atención completa
@@ -123,26 +130,26 @@ def extract_activations_and_attentions(model, tokenizer, question, max_new_token
     for layer_idx in range(num_layers):
         # Atenciones finales de esta capa
         final_attn = generation_output.attentions[final_step_idx][layer_idx]
-        # Cortar matriz de atención a tamaño correcto
         # Shape: [batch=1, num_heads, seq_len, seq_len] -> [num_heads, seq_len_total, seq_len_total]
-        final_attn_cut = final_attn[0, :, :seq_len_total, :seq_len_total].cpu().numpy()
-        attentions_by_layer.append(final_attn_cut)
+        final_attn_full = final_attn[0, :, :seq_len_total, :seq_len_total].cpu().numpy()
+        attentions_by_layer.append(final_attn_full)
+      
+    # Tokens completos (IDs): prompt + respuesta generada
+    all_tokens = generation_output.sequences[0, :seq_len_total].cpu().numpy()
     
-    # Tokens cortados (solo la parte generada, sin prompt)
-    generated_tokens_clean = generation_output.sequences[0, prompt_length:prompt_length + actual_tokens_to_use].cpu().numpy()
-    
-    # Decodificar cada token individualmente para visualización
+    # Decodificar cada token individualmente para visualización en grafos
+    # Esto permite que cada nodo del grafo tenga una etiqueta legible
     tokens_decoded = []
-    for token_id in generated_tokens_clean:
+    for token_id in all_tokens:
         token_text = tokenizer.decode([token_id], skip_special_tokens=False)
         tokens_decoded.append(token_text)
     
     return {
         'hidden_states': hidden_states_by_layer,  # [num_layers] cada uno: [seq_len_total, hidden_dim]
         'attentions': attentions_by_layer,  # [num_layers] cada uno: [num_heads, seq_len_total, seq_len_total]
-        'tokens': generated_tokens_clean,  # IDs de tokens (solo respuesta, sin prompt)
-        'tokens_decoded': tokens_decoded,  # Textos de tokens decodificados
-        'generated_answer_clean': generated_answer_clean  # Respuesta limpia
+        'tokens': all_tokens,  # IDs de TODOS los tokens (prompt + respuesta)
+        'tokens_decoded': tokens_decoded,  # Strings de TODOS los tokens decodificados
+        'generated_answer_clean': generated_answer_clean  # Respuesta limpia (solo texto generado)
     }
 
 HF_NAMES = {
@@ -217,7 +224,6 @@ def main(args):
     print(f"Número de muestras a procesar: {total_examples}")
     print(f"Tamaño de batch: {BATCH_SIZE} traces por archivo")
     print(f"Archivos esperados: {(total_examples + BATCH_SIZE - 1) // BATCH_SIZE}")
-    print(f"Corte de respuesta: {'ACTIVADO' if args.cut_response else 'DESACTIVADO'}")
     
     # Crear directorio para guardar los traces
     output_dir = Path("./traces_data")
@@ -260,8 +266,9 @@ def main(args):
                 print(f"Question ID: {unique_id}")
                 print(f"Pregunta: {question[:80]}...")
                 print(f"Respuesta limpia: {traces['generated_answer_clean'][:80]}...")
-                print(f"Tokens generados: {len(traces['tokens'])}")
-                print(f"Tokens decodificados: {traces['tokens_decoded'][:5]}...")  # Primeros 5 tokens
+                print(f"Total de tokens (prompt + respuesta): {len(traces['tokens'])}")
+                print(f"Primeros 5 tokens decodificados: {traces['tokens_decoded'][:5]}...")
+                print(f"Últimos 5 tokens decodificados: {traces['tokens_decoded'][-5:]}...")
             
         except Exception as e:
             print(f"\n⚠️  Error procesando ejemplo {idx}: {e}")
@@ -332,15 +339,17 @@ def main(args):
             print(f"Estructura de cada trace:")
             print(f"  - Campos guardados: {list(sample_trace.keys())}")
             print(f"  - Número de capas: {len(sample_trace['hidden_states'])}")
-            print(f"  - Tokens en respuesta: {len(sample_trace['tokens'])}")
+            print(f"  - Total tokens en secuencia completa: {len(sample_trace['tokens'])}")
             
             if sample_trace['hidden_states']:
-                first_layer_first_token = sample_trace['hidden_states'][0][0]
-                print(f"  - Dimensión de hidden state (primera capa, primer token): {first_layer_first_token.shape}")
+                hs_shape = sample_trace['hidden_states'][0].shape
+                print(f"  - Shape de hidden state (capa 0): {hs_shape}")
+                print(f"    → seq_len={hs_shape[0]} (prompt + respuesta), hidden_dim={hs_shape[1]}")
             
             if sample_trace['attentions']:
-                first_layer_first_token_attn = sample_trace['attentions'][0][0]
-                print(f"  - Dimensión de attention (primera capa, primer token): {first_layer_first_token_attn.shape}")
+                attn_shape = sample_trace['attentions'][0].shape
+                print(f"  - Shape de attention (capa 0): {attn_shape}")
+                print(f"    → num_heads={attn_shape[0]}, seq_len={attn_shape[1]}x{attn_shape[2]}")
     
     return batch_number  # Retorna el número de batches creados
 
