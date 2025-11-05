@@ -3,6 +3,7 @@ import random
 import os
 import numpy as np
 import pickle
+import argparse
 from pathlib import Path
 from tqdm import tqdm
 
@@ -93,8 +94,7 @@ def find_answer_cutoff_point(text, tokenizer, token_ids, prompt_length):
     return len(token_ids) - prompt_length, "full_generation"
 
 
-def extract_activations_and_attentions(model, tokenizer, question, answer=None, 
-                                       max_new_tokens=64, cut_at_period=True):
+def extract_activations_and_attentions(model, tokenizer, question, max_new_tokens=64, cut_at_period=True):
     """
     Extrae las activaciones (hidden states) y atenciones del estado final
     de la generación (después de generar todos los tokens).
@@ -118,15 +118,7 @@ def extract_activations_and_attentions(model, tokenizer, question, answer=None,
         donde seq_len_total = len(prompt) + len(respuesta_generada_limpia)
     """
     # Preparar el prompt (compatible con Qwen y Llama)
-    # Para Llama, usar formato de chat si el tokenizer lo soporta
-    if hasattr(tokenizer, 'apply_chat_template') and 'llama' in tokenizer.name_or_path.lower():
-        messages = [
-            {"role": "user", "content": f"Answer the following question concisely in one sentence:\n\n{question}"}
-        ]
-        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    else:
-        # Formato genérico para Qwen y otros
-        prompt_text = f"Answer the question concisely in one sentence.\n\nQuestion: {question}\nAnswer:"
+    prompt_text = f"Answer the question concisely in one sentence.\n\nQuestion: {question}\nAnswer:"
     
     prompt = tokenizer(prompt_text, return_tensors='pt').to(model.device)
     
@@ -143,9 +135,9 @@ def extract_activations_and_attentions(model, tokenizer, question, answer=None,
             num_return_sequences=1,
             do_sample=False,
             max_new_tokens=max_new_tokens,
-            repetition_penalty=1.5,  # Aumentado para evitar repetición
-            length_penalty=0.8,      # Penalizar respuestas largas
-            no_repeat_ngram_size=3,  # Evitar repetición de 3-gramas
+            # repetition_penalty=1.5,  # Aumentado para evitar repetición
+            # length_penalty=0.8,      # Penalizar respuestas largas
+            # no_repeat_ngram_size=3,  # Evitar repetición de 3-gramas
             early_stopping=True,     # Detener en EOS
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
@@ -234,29 +226,34 @@ def extract_activations_and_attentions(model, tokenizer, question, answer=None,
         'generated_answer_clean': generated_answer_clean  # Respuesta limpia
     }
 
+HF_NAMES = {
+    'qwen_2.5_6B' : '__'
+    'llama2_chat_7B': 'models/Llama-2-7b-chat-hf',
+}
 
-def main():
-    # Configuración del modelo
-    # Opciones:
-    # - "meta-llama/Llama-2-7b-chat-hf" (recomendado para alucinaciones)
-    # - "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit" (pre-cuantizado, pero rechaza muchas preguntas)
-    # agregando mini commit
-    model_id = "meta-llama/Llama-2-7b-chat-hf"
 
+def main(args):
+    # Extraer nombre base del modelo (sin organización)
+    model_name = args.model_id
+    model_load = HF_NAMES[f'{args.model_id}']
+    
+    # Nombre del dataset (triviaqa o truthfulqa)
+    dataset_name = args.dataset.lower()
+    
     # Configuración de batches para gestión de memoria
     BATCH_SIZE = 500
     
-    print(f"Cargando modelo: {model_id}")
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    print(f"Cargando modelo: {model_load}")
+    tokenizer = AutoTokenizer.from_pretrained(model_load)
     
     # Detectar si el modelo ya está cuantizado (bnb-4bit o bnb-8bit en el nombre)
-    is_prequantized = "bnb-4bit" in model_id.lower() or "bnb-8bit" in model_id.lower()
+    is_prequantized = "bnb-4bit" in args.model_id.lower() or "bnb-8bit" in args.model_id.lower()
     
     if is_prequantized:
         print("✅ Modelo pre-cuantizado detectado, cargando directamente...")
         # Para modelos pre-cuantizados de Unsloth, NO usar quantization_config
         model = AutoModelForCausalLM.from_pretrained(
-            model_id,
+            args.model_id,
             attn_implementation="eager",  # Necesario para extraer atenciones
             device_map="auto",
             trust_remote_code=True
@@ -270,7 +267,7 @@ def main():
             bnb_4bit_quant_type="nf4"             # Tipo de cuantización: NormalFloat4 (óptimo)
         )
         model = AutoModelForCausalLM.from_pretrained(
-            model_id,
+            args.model_id,
             attn_implementation="eager",  # Necesario para extraer atenciones
             quantization_config=bnb_config,
             device_map="auto",            # Distribución automática en GPU
@@ -280,19 +277,28 @@ def main():
     num_layers = len(model.model.layers)
     print(f"Número de capas del modelo: {num_layers}")
     
-    # Cargar dataset TriviaQA
-    print("\nCargando dataset TriviaQA...")
-    dataset = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext", split="train")
+    # Cargar dataset según especificación
+    print(f"\nCargando dataset {dataset_name}...")
+    if args.dataset.lower() == 'triviaqa':
+        dataset = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext", split="validation")
+        id_field = 'question_id'
+        question_field = 'question'
+    elif args.dataset.lower() == 'truthfulqa':
+        dataset = load_dataset("truthful_qa", "generation", split="validation")
+        id_field = None  # TruthfulQA no tiene ID único, usaremos índice
+        question_field = 'question'
+    else:
+        raise ValueError(f"Dataset no soportado: {args.dataset}. Use 'triviaqa' o 'truthfulqa'")
     
-    # Limitar el número de ejemplos si se desea (None = procesar todo el dataset)
-    num_samples = None  # Cambiar a un número específico para limitar, ej: 1000
-    if num_samples is not None:
-        dataset = dataset.select(range(min(num_samples, len(dataset))))
+    # Limitar el número de ejemplos si se especifica
+    if args.num_samples is not None:
+        dataset = dataset.select(range(min(args.num_samples, len(dataset))))
     
     total_examples = len(dataset)
     print(f"Número de muestras a procesar: {total_examples}")
     print(f"Tamaño de batch: {BATCH_SIZE} traces por archivo")
     print(f"Archivos esperados: {(total_examples + BATCH_SIZE - 1) // BATCH_SIZE}")
+    print(f"Corte de respuesta: {'ACTIVADO' if args.cut_response else 'DESACTIVADO'}")
     
     # Crear directorio para guardar los traces
     output_dir = Path("./traces_data")
@@ -304,42 +310,39 @@ def main():
     total_processed = 0
     total_errors = 0
     
-    # Estadísticas de corte
-    cutoff_stats = {}
-    
     # Procesar cada ejemplo del dataset
     for idx, example in enumerate(tqdm(dataset, desc="Extrayendo trazas")):
-        question = example['question']
-        question_id = example['question_id']  # ID único de TriviaQA
+        question = example[question_field]
+        
+        # Obtener ID único según el dataset
+        if id_field and id_field in example:
+            unique_id = example[id_field]
+        else:
+            unique_id = f"{dataset_name}_{idx}"
         
         try:
-            # Extraer activaciones y atenciones con corte automático
+            # Extraer activaciones y atenciones
             traces = extract_activations_and_attentions(
                 model=model,
                 tokenizer=tokenizer,
                 question=question,
-                answer=None,
                 max_new_tokens=64,
-                cut_at_period=True  # Activar corte inteligente
+                cut_at_period=args.cut_response
             )
             
-            # Añadir solo el question_id como metadata
-            traces['question_id'] = question_id
+            # Añadir solo el ID como metadata
+            traces['question_id'] = unique_id
             
             current_batch.append(traces)
             total_processed += 1
             
-            # Actualizar estadísticas de corte (para debugging, no se guarda)
-            num_tokens = len(traces['tokens'])
-            cutoff_stats['processed'] = cutoff_stats.get('processed', 0) + 1
-            
             # Mostrar ejemplo cada 10 muestras
             if idx % 10 == 0:
                 print(f"\n--- Ejemplo {idx} (Batch actual: {len(current_batch)}/{BATCH_SIZE}) ---")
-                print(f"Question ID: {question_id}")
-                print(f"Pregunta: {question}...")
-                print(f"Respuesta limpia: {traces['generated_answer_clean']}...")
-                print(f"Tokens generados: {num_tokens}")
+                print(f"Question ID: {unique_id}")
+                print(f"Pregunta: {question[:80]}...")
+                print(f"Respuesta limpia: {traces['generated_answer_clean'][:80]}...")
+                print(f"Tokens generados: {len(traces['tokens'])}")
                 print(f"Tokens decodificados: {traces['tokens_decoded'][:5]}...")  # Primeros 5 tokens
             
         except Exception as e:
@@ -349,7 +352,8 @@ def main():
         
         # Guardar batch cuando alcance el tamaño especificado
         if len(current_batch) >= BATCH_SIZE:
-            output_file = output_dir / f"trivia_qa_traces_batch_{batch_number:04d}.pkl"
+            # Formato: <modelo>_<dataset>_<num_batch>
+            output_file = output_dir / f"{model_name}_{dataset_name}_batch_{batch_number:04d}.pkl"
             print(f"\n💾 Guardando batch {batch_number} en {output_file.name}...")
             
             with open(output_file, 'wb') as f:
@@ -369,7 +373,7 @@ def main():
     
     # Guardar el último batch si tiene datos
     if current_batch:
-        output_file = output_dir / f"trivia_qa_traces_batch_{batch_number:04d}.pkl"
+        output_file = output_dir / f"{model_name}_{dataset_name}_batch_{batch_number:04d}.pkl"
         print(f"\n💾 Guardando último batch {batch_number} en {output_file.name}...")
         
         with open(output_file, 'wb') as f:
@@ -390,7 +394,7 @@ def main():
     
     # Listar archivos generados
     print(f"\n📁 Archivos generados:")
-    batch_files = sorted(output_dir.glob("trivia_qa_traces_batch_*.pkl"))
+    batch_files = sorted(output_dir.glob(f"{model_name}_{dataset_name}_batch_*.pkl"))
     total_size = 0
     for batch_file in batch_files:
         size_mb = batch_file.stat().st_size / (1024 * 1024)
@@ -424,7 +428,55 @@ def main():
 
 
 if __name__ == '__main__':
+    # Configurar parser de argumentos
+    parser = argparse.ArgumentParser(
+        description="Extractor de trazas de activaciones y atenciones para modelos de lenguaje"
+    )
+    
+    parser.add_argument(
+        '--model',
+        type=str,
+        default="meta-llama/Llama-2-7b-chat-hf",
+        help='ID del modelo de HuggingFace (default: meta-llama/Llama-2-7b-chat-hf)'
+    )
+    
+    parser.add_argument(
+        '--dataset',
+        type=str,
+        choices=['triviaqa', 'truthfulqa'],
+        default='triviaqa',
+        help='Dataset a utilizar: triviaqa o truthfulqa (default: triviaqa)'
+    )
+    
+    parser.add_argument(
+        '--num-samples',
+        type=int,
+        default=None,
+        help='Número de muestras a procesar (default: None = todas)'
+    )
+    
+    parser.add_argument(
+        '--cut-response',
+        action='store_true',
+        help='Activar corte inteligente de respuesta en el primer punto/señal de fin'
+    )
+    
+    parser.add_argument(
+        '--no-cut-response',
+        dest='cut_response',
+        action='store_false',
+        help='Desactivar corte de respuesta (usar generación completa)'
+    )
+    
+    parser.set_defaults(cut_response=True)  # Por defecto está activado
+    
+    args = parser.parse_args()
+    
+    # Asignar model_id desde el argumento
+    args.model_id = args.model
+    
     seed_everything(SEED_VALUE)
+    
     # --- Including the token to access to models if needed ---
     token_file = Path("llama_token.txt")
     if token_file.exists():
@@ -432,4 +484,4 @@ if __name__ == '__main__':
             t = file.read().strip()
             login(token=t)
     
-    traces = main()
+    traces = main(args)
