@@ -59,6 +59,14 @@ def find_answer_cutoff_point(text, tokenizer, token_ids, prompt_length):
         text_before_newline = text[:first_newline_idx]
         tokens_before = tokenizer.encode(text_before_newline, add_special_tokens=False)
         return len(tokens_before), "first_newline"
+
+    # Estrategia 2.1: Buscar un punto + salto de línea!. (Común en Llama).
+    first_periodnew_idx=text.find('.\n')
+    if first_periodnew_idx != -1:
+        text_before_periodnew = text[:first_periodnew_idx]
+        tokens_before = tokenizer.encode(text_before_periodnew, add_special_tokens=False)
+        return len(tokens_before), "first_periodnewline"
+
     
     # Estrategia 3: Buscar otros signos de puntuación finales (?, !)
     for punct, method in [('?', 'question_mark'), ('!', 'exclamation')]:
@@ -88,8 +96,8 @@ def find_answer_cutoff_point(text, tokenizer, token_ids, prompt_length):
 def extract_activations_and_attentions(model, tokenizer, question, answer=None, 
                                        max_new_tokens=64, cut_at_period=True):
     """
-    Extrae las activaciones (hidden states) y atenciones de todas las capas
-    durante la generación de una respuesta.
+    Extrae las activaciones (hidden states) y atenciones del estado final
+    de la generación (después de generar todos los tokens).
     
     Args:
         model: Modelo de lenguaje cargado
@@ -101,15 +109,13 @@ def extract_activations_and_attentions(model, tokenizer, question, answer=None,
         
     Returns:
         dict con:
-            - 'question': pregunta original
-            - 'generated_text': texto generado completo
-            - 'generated_answer': respuesta sin el prompt
             - 'generated_answer_clean': respuesta cortada en punto/señal de fin
-            - 'hidden_states': lista de hidden states por capa y token
-            - 'attentions': lista de matrices de atención por capa y token
+            - 'hidden_states': lista de arrays por capa [seq_len_total, hidden_dim]
+            - 'attentions': lista de arrays por capa [num_heads, seq_len_total, seq_len_total]
             - 'tokens': tokens generados (IDs)
-            - 'cutoff_method': método usado para cortar la respuesta
-            - 'tokens_before_cutoff': número de tokens antes del corte
+            - 'tokens_decoded': tokens como strings
+            
+        donde seq_len_total = len(prompt) + len(respuesta_generada_limpia)
     """
     # Preparar el prompt (compatible con Qwen y Llama)
     # Para Llama, usar formato de chat si el tokenizer lo soporta
@@ -176,32 +182,40 @@ def extract_activations_and_attentions(model, tokenizer, question, answer=None,
         generated_answer_clean = generated_answer
         cutoff_method = "no_cutoff_applied"
     
-    # Extraer hidden states y attentions SOLO hasta el punto de corte
+    # Extraer hidden states y attentions del ESTADO FINAL (último paso de generación)
     num_generated_tokens = len(generation_output.hidden_states)
     num_layers = len(generation_output.hidden_states[0]) - 1  # -1 porque incluye embeddings
     
     # Limitar al número de tokens que realmente queremos
     tokens_to_extract = min(actual_tokens_to_use, num_generated_tokens)
     
-    # Organizar hidden states: [capa][paso_generación][batch, seq_len, hidden_dim]
+    # Índice del último paso de generación
+    final_step_idx = tokens_to_extract - 1
+    
+    # Longitud total de la secuencia (prompt + tokens generados)
+    seq_len_total = prompt_length + tokens_to_extract
+    
+    # Organizar hidden states: [capa] -> array[seq_len_total, hidden_dim]
+    # Extraemos SOLO el último paso que contiene el estado completo
     hidden_states_by_layer = []
     for layer_idx in range(1, num_layers + 1):  # Empezar desde 1 para saltar embeddings
-        layer_states = []
-        for token_step in range(tokens_to_extract):
-            # Extraer el hidden state de esta capa en este paso
-            state = generation_output.hidden_states[token_step][layer_idx]
-            layer_states.append(state.cpu().numpy())
-        hidden_states_by_layer.append(layer_states)
+        # Estado final de esta capa (incluye prompt + todos los tokens generados)
+        final_state = generation_output.hidden_states[final_step_idx][layer_idx]
+        # Cortar para incluir solo: prompt + tokens generados hasta el corte
+        # Shape: [batch=1, seq_len, hidden_dim] -> [seq_len_total, hidden_dim]
+        final_state_cut = final_state[0, :seq_len_total, :].cpu().numpy()
+        hidden_states_by_layer.append(final_state_cut)
     
-    # Organizar attentions: [capa][paso_generación][batch, num_heads, seq_len, seq_len]
+    # Organizar attentions: [capa] -> array[num_heads, seq_len_total, seq_len_total]
+    # Extraemos SOLO el último paso que contiene la matriz de atención completa
     attentions_by_layer = []
     for layer_idx in range(num_layers):
-        layer_attns = []
-        for token_step in range(tokens_to_extract):
-            # Extraer la matriz de atención de esta capa en este paso
-            attn = generation_output.attentions[token_step][layer_idx]
-            layer_attns.append(attn.cpu().numpy())
-        attentions_by_layer.append(layer_attns)
+        # Atenciones finales de esta capa
+        final_attn = generation_output.attentions[final_step_idx][layer_idx]
+        # Cortar matriz de atención a tamaño correcto
+        # Shape: [batch=1, num_heads, seq_len, seq_len] -> [num_heads, seq_len_total, seq_len_total]
+        final_attn_cut = final_attn[0, :, :seq_len_total, :seq_len_total].cpu().numpy()
+        attentions_by_layer.append(final_attn_cut)
     
     # Tokens cortados (solo la parte generada, sin prompt)
     generated_tokens_clean = generation_output.sequences[0, prompt_length:prompt_length + actual_tokens_to_use].cpu().numpy()
@@ -213,8 +227,8 @@ def extract_activations_and_attentions(model, tokenizer, question, answer=None,
         tokens_decoded.append(token_text)
     
     return {
-        'hidden_states': hidden_states_by_layer,  # [num_layers][tokens_to_extract]
-        'attentions': attentions_by_layer,  # [num_layers][tokens_to_extract]
+        'hidden_states': hidden_states_by_layer,  # [num_layers] cada uno: [seq_len_total, hidden_dim]
+        'attentions': attentions_by_layer,  # [num_layers] cada uno: [num_heads, seq_len_total, seq_len_total]
         'tokens': generated_tokens_clean,  # IDs de tokens (solo respuesta, sin prompt)
         'tokens_decoded': tokens_decoded,  # Textos de tokens decodificados
         'generated_answer_clean': generated_answer_clean  # Respuesta limpia

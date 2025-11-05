@@ -61,35 +61,31 @@ def analyze_trace(trace, trace_idx=0, dataset=None):
     print(f"\n🧠 Hidden States:")
     print(f"   - Estructura: {len(trace['hidden_states'])} capas")
     if trace['hidden_states']:
-        # Analizar primera capa
+        # Analizar primera capa (ahora es un array 2D, no una lista)
         first_layer = trace['hidden_states'][0]
-        print(f"   - Tokens capturados por capa: {len(first_layer)}")
-        if first_layer:
-            first_state = first_layer[0]
-            print(f"   - Shape de cada estado: {first_state.shape}")
-            print(f"   - Dimensión oculta: {first_state.shape[-1]}")
+        print(f"   - Shape primera capa: {first_layer.shape}")
+        seq_len_total, hidden_dim = first_layer.shape
+        print(f"   - Tokens totales (prompt + respuesta): {seq_len_total}")
+        print(f"   - Dimensión oculta: {hidden_dim}")
     
     # Análisis de atenciones
     print(f"\n👁️  Attention Matrices:")
     print(f"   - Estructura: {len(trace['attentions'])} capas")
     if trace['attentions']:
-        # Analizar primera capa
+        # Analizar primera capa (ahora es un array 3D, no una lista)
         first_layer_attn = trace['attentions'][0]
-        print(f"   - Tokens capturados por capa: {len(first_layer_attn)}")
-        if first_layer_attn:
-            first_attn = first_layer_attn[0]
-            print(f"   - Shape de cada matriz: {first_attn.shape}")
-            batch, num_heads, seq_len, _ = first_attn.shape
-            print(f"   - Número de cabezas: {num_heads}")
-            print(f"   - Secuencia máxima: {seq_len}")
-            
-            # Estadísticas de la primera matriz de atención
-            print(f"\n   📊 Estadísticas (primera matriz, promedio sobre cabezas):")
-            avg_attn = first_attn[0].mean(axis=0)  # Promediar sobre cabezas
-            print(f"      - Media: {avg_attn.mean():.4f}")
-            print(f"      - Std: {avg_attn.std():.4f}")
-            print(f"      - Min: {avg_attn.min():.4f}")
-            print(f"      - Max: {avg_attn.max():.4f}")
+        print(f"   - Shape primera capa: {first_layer_attn.shape}")
+        num_heads, seq_len, _ = first_layer_attn.shape
+        print(f"   - Número de cabezas: {num_heads}")
+        print(f"   - Secuencia total: {seq_len}")
+        
+        # Estadísticas de la matriz de atención
+        print(f"\n   📊 Estadísticas (promedio sobre cabezas):")
+        avg_attn = first_layer_attn.mean(axis=0)  # Promediar sobre cabezas
+        print(f"      - Media: {avg_attn.mean():.4f}")
+        print(f"      - Std: {avg_attn.std():.4f}")
+        print(f"      - Min: {avg_attn.min():.4f}")
+        print(f"      - Max: {avg_attn.max():.4f}")
 
 
 def analyze_dataset_statistics(traces):
