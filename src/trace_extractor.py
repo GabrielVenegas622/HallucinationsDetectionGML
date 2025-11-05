@@ -29,72 +29,7 @@ def seed_everything(seed: int):
 
 SEED_VALUE = 41
 
-
-def find_answer_cutoff_point(text, tokenizer, token_ids, prompt_length):
-    """
-    Encuentra el punto de corte óptimo para la respuesta.
-    Intenta múltiples estrategias para detectar dónde termina la respuesta real.
-    
-    Args:
-        text: Texto generado completo
-        tokenizer: Tokenizer del modelo
-        token_ids: IDs de tokens generados (numpy array)
-        prompt_length: Longitud del prompt en tokens
-        
-    Returns:
-        tuple: (cutoff_token_index, cutoff_method)
-            cutoff_token_index: índice del token donde cortar (relativo al inicio de la generación)
-            cutoff_method: string indicando qué método se usó
-    """
-    # Estrategia 1: Buscar el primer punto seguido de espacio o final
-    first_period_idx = text.find('.')
-    if first_period_idx != -1:
-        # Encontrar en qué token está el punto
-        text_before_period = text[:first_period_idx + 1]
-        tokens_before = tokenizer.encode(text_before_period, add_special_tokens=False)
-        return len(tokens_before), "first_period"
-    
-    # Estrategia 2: Buscar salto de línea (común cuando el modelo empieza a divagar)
-    first_newline_idx = text.find('\n')
-    if first_newline_idx != -1:
-        text_before_newline = text[:first_newline_idx]
-        tokens_before = tokenizer.encode(text_before_newline, add_special_tokens=False)
-        return len(tokens_before), "first_newline"
-
-    # Estrategia 2.1: Buscar un punto + salto de línea!. (Común en Llama).
-    first_periodnew_idx=text.find('.\n')
-    if first_periodnew_idx != -1:
-        text_before_periodnew = text[:first_periodnew_idx]
-        tokens_before = tokenizer.encode(text_before_periodnew, add_special_tokens=False)
-        return len(tokens_before), "first_periodnewline"
-
-    
-    # Estrategia 3: Buscar otros signos de puntuación finales (?, !)
-    for punct, method in [('?', 'question_mark'), ('!', 'exclamation')]:
-        idx = text.find(punct)
-        if idx != -1:
-            text_before = text[:idx + 1]
-            tokens_before = tokenizer.encode(text_before, add_special_tokens=False)
-            return len(tokens_before), method
-    
-    # Estrategia 4: Detectar repetición (común en generaciones redundantes)
-    words = text.split()
-    if len(words) > 10:
-        # Buscar secuencias repetidas
-        for i in range(len(words) - 3):
-            window = ' '.join(words[i:i+3])
-            rest = ' '.join(words[i+3:])
-            if window in rest:
-                # Hay repetición, cortar antes
-                text_before_repeat = ' '.join(words[:i])
-                tokens_before = tokenizer.encode(text_before_repeat, add_special_tokens=False)
-                return max(1, len(tokens_before)), "repetition_detected"
-    
-    # Estrategia 5: Si todo falla, usar toda la generación
-    return len(token_ids) - prompt_length, "full_generation"
-
-
-def extract_activations_and_attentions(model, tokenizer, question, max_new_tokens=64, cut_at_period=True):
+def extract_activations_and_attentions(model, tokenizer, question, max_new_tokens=64):
     """
     Extrae las activaciones (hidden states) y atenciones del estado final
     de la generación (después de generar todos los tokens).
@@ -135,12 +70,11 @@ def extract_activations_and_attentions(model, tokenizer, question, max_new_token
             num_return_sequences=1,
             do_sample=False,
             max_new_tokens=max_new_tokens,
-            # repetition_penalty=1.5,  # Aumentado para evitar repetición
-            # length_penalty=0.8,      # Penalizar respuestas largas
-            # no_repeat_ngram_size=3,  # Evitar repetición de 3-gramas
+
             early_stopping=True,     # Detener en EOS
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
+
             return_dict_in_generate=True,
             output_attentions=True,
             output_hidden_states=True
@@ -156,23 +90,8 @@ def extract_activations_and_attentions(model, tokenizer, question, max_new_token
         skip_special_tokens=True
     )
     
-    # Determinar punto de corte
-    cutoff_token_count, cutoff_method = find_answer_cutoff_point(
-        generated_answer, tokenizer, generated_ids, prompt_length
-    )
-    
-    # Aplicar corte si está habilitado
-    if cut_at_period and cutoff_token_count < len(generated_ids) - prompt_length:
-        # Cortar en el punto detectado
-        actual_tokens_to_use = cutoff_token_count
-        generated_answer_clean = tokenizer.decode(
-            generation_output.sequences[0, prompt_length:prompt_length + actual_tokens_to_use],
-            skip_special_tokens=True
-        )
-    else:
-        actual_tokens_to_use = len(generated_ids) - prompt_length
-        generated_answer_clean = generated_answer
-        cutoff_method = "no_cutoff_applied"
+    actual_tokens_to_use = len(generated_ids) - prompt_length
+    generated_answer_clean = generated_answer
     
     # Extraer hidden states y attentions del ESTADO FINAL (último paso de generación)
     num_generated_tokens = len(generation_output.hidden_states)
@@ -327,7 +246,6 @@ def main(args):
                 tokenizer=tokenizer,
                 question=question,
                 max_new_tokens=64,
-                cut_at_period=args.cut_response
             )
             
             # Añadir solo el ID como metadata
@@ -454,21 +372,6 @@ if __name__ == '__main__':
         default=None,
         help='Número de muestras a procesar (default: None = todas)'
     )
-    
-    parser.add_argument(
-        '--cut-response',
-        action='store_true',
-        help='Activar corte inteligente de respuesta en el primer punto/señal de fin'
-    )
-    
-    parser.add_argument(
-        '--no-cut-response',
-        dest='cut_response',
-        action='store_false',
-        help='Desactivar corte de respuesta (usar generación completa)'
-    )
-    
-    parser.set_defaults(cut_response=True)  # Por defecto está activado
     
     args = parser.parse_args()
     
