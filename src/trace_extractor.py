@@ -204,17 +204,11 @@ def extract_activations_and_attentions(model, tokenizer, question, answer=None,
         tokens_decoded.append(token_text)
     
     return {
-        'question': question,
-        'generated_answer_clean': generated_answer_clean,  # Solo la respuesta limpia
         'hidden_states': hidden_states_by_layer,  # [num_layers][tokens_to_extract]
         'attentions': attentions_by_layer,  # [num_layers][tokens_to_extract]
         'tokens': generated_tokens_clean,  # IDs de tokens (solo respuesta, sin prompt)
         'tokens_decoded': tokens_decoded,  # Textos de tokens decodificados
-        'prompt_length': prompt_length,
-        'num_layers': num_layers,
-        'cutoff_method': cutoff_method,
-        'tokens_before_cutoff': actual_tokens_to_use,
-        'tokens_after_cutoff': len(generated_ids) - prompt_length - actual_tokens_to_use
+        'generated_answer_clean': generated_answer_clean  # Respuesta limpia
     }
 
 
@@ -223,7 +217,7 @@ def main():
     model_id = "Qwen/Qwen3-4B-Instruct-2507"
     
     # Configuración de batches para gestión de memoria
-    BATCH_SIZE = 500  # Guardar cada 500 traces (~5GB por archivo)
+    BATCH_SIZE = 500
     
     print(f"Cargando modelo: {model_id}")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -272,8 +266,7 @@ def main():
     # Procesar cada ejemplo del dataset
     for idx, example in enumerate(tqdm(dataset, desc="Extrayendo trazas")):
         question = example['question']
-        # TriviaQA tiene múltiples respuestas posibles
-        answer_aliases = example['answer']['aliases'] if 'answer' in example else None
+        question_id = example['question_id']  # ID único de TriviaQA
         
         try:
             # Extraer activaciones y atenciones con corte automático
@@ -281,31 +274,28 @@ def main():
                 model=model,
                 tokenizer=tokenizer,
                 question=question,
-                answer=answer_aliases,
+                answer=None,
                 max_new_tokens=64,
                 cut_at_period=True  # Activar corte inteligente
             )
             
-            # Añadir metadata del ejemplo
-            traces['example_id'] = len(current_batch)  # ID dentro del batch
-            traces['global_example_id'] = idx  # ID global en el dataset completo
-            traces['batch_number'] = batch_number  # Número de batch
-            traces['ground_truth_answers'] = answer_aliases
+            # Añadir solo el question_id como metadata
+            traces['question_id'] = question_id
             
             current_batch.append(traces)
             total_processed += 1
             
-            # Actualizar estadísticas de corte
-            method = traces['cutoff_method']
-            cutoff_stats[method] = cutoff_stats.get(method, 0) + 1
+            # Actualizar estadísticas de corte (para debugging, no se guarda)
+            num_tokens = len(traces['tokens'])
+            cutoff_stats['processed'] = cutoff_stats.get('processed', 0) + 1
             
             # Mostrar ejemplo cada 10 muestras
             if idx % 10 == 0:
                 print(f"\n--- Ejemplo {idx} (Batch actual: {len(current_batch)}/{BATCH_SIZE}) ---")
+                print(f"Question ID: {question_id}")
                 print(f"Pregunta: {question[:70]}...")
                 print(f"Respuesta limpia: {traces['generated_answer_clean'][:70]}...")
-                print(f"Método de corte: {traces['cutoff_method']}")
-                print(f"Tokens usados: {traces['tokens_before_cutoff']} (descartados: {traces['tokens_after_cutoff']})")
+                print(f"Tokens generados: {num_tokens}")
                 print(f"Tokens decodificados: {traces['tokens_decoded'][:5]}...")  # Primeros 5 tokens
             
         except Exception as e:
@@ -354,12 +344,6 @@ def main():
     print(f"Total de batches guardados: {batch_number}")
     print(f"Directorio de salida: {output_dir.absolute()}")
     
-    # Mostrar estadísticas de métodos de corte
-    print(f"\n📊 Estadísticas de métodos de corte:")
-    for method, count in sorted(cutoff_stats.items(), key=lambda x: x[1], reverse=True):
-        percentage = (count / total_processed) * 100 if total_processed > 0 else 0
-        print(f"   • {method}: {count} ({percentage:.1f}%)")
-    
     # Listar archivos generados
     print(f"\n📁 Archivos generados:")
     batch_files = sorted(output_dir.glob("trivia_qa_traces_batch_*.pkl"))
@@ -380,12 +364,9 @@ def main():
         if first_batch:
             sample_trace = first_batch[0]
             print(f"Estructura de cada trace:")
-            print(f"  - Número de capas: {sample_trace['num_layers']}")
-            print(f"  - Hidden states shape por capa: {len(sample_trace['hidden_states'])} capas")
-            print(f"  - Attentions shape por capa: {len(sample_trace['attentions'])} capas")
-            print(f"  - Método de corte usado: {sample_trace['cutoff_method']}")
-            print(f"  - Tokens antes del corte: {sample_trace['tokens_before_cutoff']}")
-            print(f"  - Tokens después del corte: {sample_trace['tokens_after_cutoff']}")
+            print(f"  - Campos guardados: {list(sample_trace.keys())}")
+            print(f"  - Número de capas: {len(sample_trace['hidden_states'])}")
+            print(f"  - Tokens en respuesta: {len(sample_trace['tokens'])}")
             
             if sample_trace['hidden_states']:
                 first_layer_first_token = sample_trace['hidden_states'][0][0]

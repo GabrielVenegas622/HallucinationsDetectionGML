@@ -15,37 +15,45 @@ def load_traces(traces_file):
     return traces
 
 
-def analyze_trace(trace, trace_idx=0):
+def analyze_trace(trace, trace_idx=0, dataset=None):
     """Analiza un trace individual y muestra información detallada."""
     print(f"\n{'='*80}")
     print(f"ANÁLISIS DEL TRACE #{trace_idx}")
     print(f"{'='*80}")
     
     # Información básica
-    print(f"\n📝 Pregunta: {trace['question']}")
-    print(f"\n💬 Respuesta Limpia: {trace['generated_answer_clean']}")
+    question_id = trace.get('question_id', 'N/A')
+    print(f"\n🆔 Question ID: {question_id}")
     
-    if trace.get('ground_truth_answers'):
-        print(f"\n✅ Respuestas Correctas:")
-        for i, ans in enumerate(trace['ground_truth_answers'][:3], 1):
-            print(f"   {i}. {ans}")
+    # Si tenemos acceso al dataset, recuperar pregunta y respuestas
+    if dataset is not None and question_id != 'N/A':
+        try:
+            # Buscar en el dataset por question_id
+            example = next((ex for ex in dataset if ex['question_id'] == question_id), None)
+            if example:
+                print(f"\n📝 Pregunta (recuperada): {example['question']}")
+                if 'answer' in example:
+                    print(f"\n✅ Respuestas Correctas:")
+                    for i, ans in enumerate(example['answer']['aliases'][:3], 1):
+                        print(f"   {i}. {ans}")
+        except:
+            pass
+    
+    print(f"\n💬 Respuesta Generada: {trace['generated_answer_clean']}")
     
     # Información de tokens
-    num_tokens_generated = len(trace['tokens'])  # Ahora tokens solo contiene la respuesta
+    num_tokens_generated = len(trace['tokens'])
     print(f"\n🔢 Tokens:")
-    print(f"   - Tokens en respuesta limpia: {num_tokens_generated}")
-    print(f"   - Tokens antes del corte: {trace.get('tokens_before_cutoff', num_tokens_generated)}")
-    print(f"   - Tokens descartados: {trace.get('tokens_after_cutoff', 0)}")
-    print(f"   - Método de corte: {trace.get('cutoff_method', 'N/A')}")
+    print(f"   - Tokens en respuesta: {num_tokens_generated}")
     
     # Mostrar tokens decodificados si están disponibles
     if 'tokens_decoded' in trace:
-        print(f"\n📝 Tokens decodificados (primeros 10):")
+        print(f"\n📝 Tokens decodificados:")
         for i, token_text in enumerate(trace['tokens_decoded'][:10]):
             print(f"   {i}: '{token_text}'")
     
     # Información de capas
-    num_layers = trace['num_layers']
+    num_layers = len(trace['hidden_states'])
     print(f"\n🏗️  Arquitectura:")
     print(f"   - Número de capas: {num_layers}")
     
@@ -95,16 +103,11 @@ def analyze_dataset_statistics(traces):
     
     # Longitudes de respuestas
     answer_lengths = []
-    cutoff_methods = {}
     
     for trace in traces:
-        # Ahora tokens solo contiene la respuesta limpia
+        # Tokens solo contiene la respuesta limpia
         num_generated = len(trace['tokens'])
         answer_lengths.append(num_generated)
-        
-        # Recopilar métodos de corte
-        method = trace.get('cutoff_method', 'unknown')
-        cutoff_methods[method] = cutoff_methods.get(method, 0) + 1
     
     print(f"\n📏 Longitud de respuestas limpias:")
     print(f"   - Media: {np.mean(answer_lengths):.2f} tokens")
@@ -113,15 +116,8 @@ def analyze_dataset_statistics(traces):
     print(f"   - Max: {np.max(answer_lengths)} tokens")
     print(f"   - Std: {np.std(answer_lengths):.2f} tokens")
     
-    # Mostrar métodos de corte
-    if cutoff_methods:
-        print(f"\n✂️  Métodos de corte utilizados:")
-        for method, count in sorted(cutoff_methods.items(), key=lambda x: x[1], reverse=True):
-            percentage = (count / num_traces) * 100
-            print(f"   • {method}: {count} ({percentage:.1f}%)")
-    
-    # Verificar consistencia
-    num_layers_list = [trace['num_layers'] for trace in traces]
+    # Verificar consistencia de capas
+    num_layers_list = [len(trace['hidden_states']) for trace in traces]
     unique_layers = set(num_layers_list)
     print(f"\n🏗️  Capas por modelo: {unique_layers}")
     
@@ -140,6 +136,17 @@ def main():
         print("   Ejecuta primero trace_extractor.py")
         return
     
+    # Intentar cargar TriviaQA para recuperar información
+    dataset = None
+    try:
+        from datasets import load_dataset
+        print("Cargando TriviaQA para recuperar preguntas y respuestas...")
+        dataset = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext", split="train")
+        print(f"✅ Dataset cargado: {len(dataset)} ejemplos")
+    except Exception as e:
+        print(f"⚠️  No se pudo cargar TriviaQA: {e}")
+        print("   Continuando sin recuperar preguntas/respuestas originales")
+    
     # Buscar archivos pickle (batch y archivos antiguos)
     batch_files = sorted(traces_dir.glob("trivia_qa_traces_batch_*.pkl"))
     old_files = list(traces_dir.glob("trivia_qa_traces_*.pkl"))
@@ -150,7 +157,7 @@ def main():
         return
     
     # Mostrar información sobre archivos encontrados
-    print(f"{'='*80}")
+    print(f"\n{'='*80}")
     print("ARCHIVOS DE TRACES ENCONTRADOS")
     print(f"{'='*80}\n")
     
@@ -177,9 +184,8 @@ def main():
         
         all_traces_count = 0
         answer_lengths = []
-        cutoff_methods = {}
         
-        # Analizar cada batch
+        # Analizar cada batch y mostrar 5 ejemplos
         for batch_idx, batch_file in enumerate(batch_files):
             print(f"📂 Cargando batch {batch_idx}: {batch_file.name}...")
             
@@ -196,17 +202,42 @@ def main():
                 for trace in traces:
                     num_generated = len(trace['tokens'])  # Ahora solo contiene respuesta
                     answer_lengths.append(num_generated)
-                    
-                    # Métodos de corte
-                    method = trace.get('cutoff_method', 'unknown')
-                    cutoff_methods[method] = cutoff_methods.get(method, 0) + 1
                 
-                # Mostrar ejemplo del primer batch
+                # Mostrar 5 ejemplos de este batch
+                print(f"\n   --- 5 Ejemplos del batch {batch_idx} ---")
+                for i in range(min(5, len(traces))):
+                    trace = traces[i]
+                    question_id = trace.get('question_id', 'N/A')
+                    num_tokens = len(trace['tokens'])
+                    
+                    # Intentar recuperar pregunta del dataset
+                    question_text = "N/A"
+                    if dataset is not None:
+                        try:
+                            example = next((ex for ex in dataset if ex['question_id'] == question_id), None)
+                            if example:
+                                question_text = example['question'][:60] + "..."
+                        except:
+                            pass
+                    
+                    print(f"\n   {i+1}. Question ID: {question_id}")
+                    print(f"      Pregunta: {question_text}")
+                    print(f"      Respuesta: {trace['generated_answer_clean'][:60]}...")
+                    print(f"      Tokens: {num_tokens}")
+                    if 'tokens_decoded' in trace:
+                        print(f"      Decodificados: {trace['tokens_decoded'][:3]}...")
+                
+                # Solo mostrar detalle completo del primer ejemplo del primer batch
                 if batch_idx == 0 and traces:
-                    analyze_trace(traces[0], 0)
+                    print(f"\n{'='*80}")
+                    print("ANÁLISIS DETALLADO DEL PRIMER TRACE")
+                    print(f"{'='*80}")
+                    analyze_trace(traces[0], 0, dataset)
                 
             except Exception as e:
                 print(f"   ❌ Error cargando batch {batch_idx}: {e}")
+                import traceback
+                traceback.print_exc()
         
         # Estadísticas globales
         print(f"\n{'='*80}")
@@ -222,36 +253,7 @@ def main():
             print(f"   - Min: {np.min(answer_lengths)} tokens")
             print(f"   - Max: {np.max(answer_lengths)} tokens")
             print(f"   - Std: {np.std(answer_lengths):.2f} tokens")
-        
-        # Mostrar métodos de corte
-        if cutoff_methods:
-            print(f"\n✂️  Métodos de corte utilizados:")
-            for method, count in sorted(cutoff_methods.items(), key=lambda x: x[1], reverse=True):
-                percentage = (count / all_traces_count) * 100 if all_traces_count > 0 else 0
-                print(f"   • {method}: {count} ({percentage:.1f}%)")
-        
-        # Mostrar algunos ejemplos de diferentes batches
-        print(f"\n{'='*80}")
-        print("EJEMPLOS DE DIFERENTES BATCHES")
-        print(f"{'='*80}")
-        
-        for batch_idx in [0, len(batch_files)//2, len(batch_files)-1]:
-            if batch_idx < len(batch_files):
-                print(f"\n--- Ejemplo del batch {batch_idx} ---")
-                with open(batch_files[batch_idx], 'rb') as f:
-                    traces = pickle.load(f)
-                if traces:
-                    trace = traces[0]
-                    num_gen = len(trace['tokens'])  # Solo respuesta
-                    print(f"  Q: {trace['question'][:60]}...")
-                    print(f"  A: {trace['generated_answer_clean'][:60]}...")
-                    print(f"  Tokens generados: {num_gen}")
-                    print(f"  Método de corte: {trace.get('cutoff_method', 'N/A')}")
-                    print(f"  Batch number: {trace.get('batch_number', 'N/A')}")
-                    print(f"  Global ID: {trace.get('global_example_id', 'N/A')}")
-                    if 'tokens_decoded' in trace:
-                        print(f"  Tokens: {trace['tokens_decoded'][:5]}...")
-        
+    
     # Si hay archivos antiguos, también analizarlos
     elif old_files:
         traces_file = old_files[0]
@@ -262,7 +264,7 @@ def main():
             print(f"✅ Cargado exitosamente: {len(traces)} traces")
             analyze_dataset_statistics(traces)
             if traces:
-                analyze_trace(traces[0], 0)
+                analyze_trace(traces[0], 0, dataset)
         except Exception as e:
             print(f"❌ Error al cargar los traces: {e}")
             import traceback
