@@ -293,7 +293,8 @@ def generate_ground_truth_scores(args):
     df = df.sort_values('question_id')
     
     # Guardar archivo completo con todas las columnas
-    output_path_full = Path(args.output).with_suffix('_full.csv')
+    full = args.output.split('.')[0] + '_full'
+    output_path_full = Path(full).with_suffix('.csv')
     df_full = df.copy()
     # Convertir la lista de scores a string para guardarla en CSV
     df_full['all_scores'] = df_full['all_scores'].apply(lambda x: ';'.join([f'{s:.4f}' for s in x]))

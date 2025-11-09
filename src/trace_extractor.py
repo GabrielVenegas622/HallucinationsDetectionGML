@@ -67,6 +67,7 @@ def extract_activations_and_attentions(model, tokenizer, question, max_new_token
     """
     # Preparar el prompt (compatible con Llama)
     prompt_text = f"Answer the question concisely in one sentence.\n\nQuestion: {question}\nAnswer:"
+    prompt_text = f"Answer the question concisely. Q: {question} A:"
     
     prompt = tokenizer(prompt_text, return_tensors='pt').to(model.device)
     
@@ -264,8 +265,8 @@ def main(args):
             if idx % 10 == 0:
                 print(f"\n--- Ejemplo {idx} (Batch actual: {len(current_batch)}/{BATCH_SIZE}) ---")
                 print(f"Question ID: {unique_id}")
-                print(f"Pregunta: {question[:80]}...")
-                print(f"Respuesta limpia: {traces['generated_answer_clean'][:80]}...")
+                print(f"Pregunta: {question}")
+                print(f"Respuesta limpia: {traces['generated_answer_clean']}")
                 print(f"Total de tokens (prompt + respuesta): {len(traces['tokens'])}")
                 print(f"Primeros 5 tokens decodificados: {traces['tokens_decoded'][:5]}...")
                 print(f"Últimos 5 tokens decodificados: {traces['tokens_decoded'][-5:]}...")
