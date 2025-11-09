@@ -19,7 +19,7 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 from datasets import load_dataset
-from bleurt_pytorch import BleurtConfig, BleurtForSequenceClassification, BleurtTokenizer
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
 
 
@@ -28,7 +28,7 @@ def load_bleurt_model(device='cuda' if torch.cuda.is_available() else 'cpu'):
     Carga el modelo BLEURT desde HuggingFace.
     
     Usamos la implementación oficial de BLEURT adaptada para HuggingFace.
-    Modelo: lucadiliello/BLEURT-20
+    Modelo: Elron/bleurt-base-128 o lucadiliello/BLEURT-20
     
     Args:
         device: 'cuda' o 'cpu'
@@ -39,17 +39,52 @@ def load_bleurt_model(device='cuda' if torch.cuda.is_available() else 'cpu'):
     print(f"Cargando modelo BLEURT en {device}...")
     
     # Usar la implementación de BLEURT disponible en HuggingFace
-    model_name = 'lucadiliello/BLEURT-20'
+    model_name = "Elron/bleurt-base-128"
     
-
-    config = BleurtConfig.from_pretrained(model_name)
-    tokenizer = BleurtTokenizer.from_pretrained(model_name)
-    model = BleurtForSequenceClassification.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name)
     model.to(device)
     model.eval()
     
     print("✅ Modelo BLEURT cargado correctamente")
     return tokenizer, model
+
+
+def compute_bleurt_score(references, candidates, tokenizer, model, device='cuda'):
+    """
+    Calcula scores BLEURT para pares de referencia-candidato.
+    
+    Args:
+        references: Lista de textos de referencia (ground truth)
+        candidates: Lista de textos candidatos (generados)
+        tokenizer: Tokenizer de BLEURT
+        model: Modelo BLEURT
+        device: Dispositivo para cómputo
+        
+    Returns:
+        List[float]: Scores BLEURT (valores más altos = mejor)
+    """
+    scores = []
+    
+    with torch.no_grad():
+        for ref, cand in zip(references, candidates):
+            # Tokenizar el par referencia-candidato
+            inputs = tokenizer(
+                ref, 
+                cand, 
+                return_tensors='pt', 
+                padding=True, 
+                truncation=True,
+                max_length=128
+            ).to(device)
+            
+            # Obtener el score
+            outputs = model(**inputs)
+            score = outputs.logits.squeeze().item()
+            scores.append(score)
+    
+    return scores
+
 
 def compute_max_bleurt_score(reference_answers, generated_answer, tokenizer, model, device='cuda'):
     """
@@ -73,28 +108,29 @@ def compute_max_bleurt_score(reference_answers, generated_answer, tokenizer, mod
         return 0.0, '', []
     
     all_scores = []
-    generated_answers = [generated_answer]*len(reference_answers)
+    
     with torch.no_grad():
-        # Tokenizar el par referencia-candidato
-        inputs = tokenizer(
-            reference_answers, 
-            generated_answers, 
-            return_tensors='pt', 
-            padding=True, 
-            truncation=True,
-            max_length=128
-        ).to(device)
-        
-        # Obtener el score
-        outputs = model(**inputs)
-        all_scores = outputs.logits.flatten().tolist()
-
+        for ref_answer in reference_answers:
+            # Tokenizar el par referencia-candidato
+            inputs = tokenizer(
+                ref_answer, 
+                generated_answer, 
+                return_tensors='pt', 
+                padding=True, 
+                truncation=True,
+                max_length=128
+            ).to(device)
+            
+            # Obtener el score
+            outputs = model(**inputs)
+            score = outputs.logits.squeeze().item()
+            all_scores.append(score)
     
     # Encontrar el score máximo y su referencia correspondiente
     max_score = max(all_scores)
     max_idx = all_scores.index(max_score)
     best_reference = reference_answers[max_idx]
-    print(max_score, best_reference, all_scores)
+    
     return max_score, best_reference, all_scores
 
 
@@ -264,7 +300,6 @@ def generate_ground_truth_scores(args):
         reference_answers = ground_truth[question_id]
         
         # Calcular score BLEURT máximo comparando con TODAS las referencias
-        print(f"Respuesta: {generated_answer}, GT: {reference_answers}")
         max_score, best_reference, all_scores = compute_max_bleurt_score(
             reference_answers, 
             generated_answer, 
@@ -293,7 +328,7 @@ def generate_ground_truth_scores(args):
     df = df.sort_values('question_id')
     
     # Guardar archivo completo con todas las columnas
-    output_path_full = Path(args.output).with_suffix('_full.csv')
+    output_path_full = Path(args.output).with_suffix('.full.csv')
     df_full = df.copy()
     # Convertir la lista de scores a string para guardarla en CSV
     df_full['all_scores'] = df_full['all_scores'].apply(lambda x: ';'.join([f'{s:.4f}' for s in x]))
