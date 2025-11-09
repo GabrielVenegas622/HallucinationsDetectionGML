@@ -3,3 +3,4 @@ help.md
 data/
 ignore/
 traces_data/
+*.pkl
