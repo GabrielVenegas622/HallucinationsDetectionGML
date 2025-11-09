@@ -1,1 +1,963 @@
+"""
+Experimentos de Ablación: Comparación de 3 Arquitecturas
+
+Este script implementa la estrategia de ablación para probar la hipótesis:
+"La dinámica estructural secuencial a través de las capas es la señal clave"
+
+MODELOS:
+1. LSTM-solo (Baseline): Sin estructura de grafo, solo secuencia de capas
+2. GNN-det+LSTM (CHARM-style): Con estructura de grafo (determinista)
+3. GVAE+LSTM (Propuesto): Con estructura + modelado de incertidumbre (variacional)
+
+HIPÓTESIS A PROBAR:
+Si GVAE+LSTM > GNN-det+LSTM > LSTM-solo, entonces la estructura del grafo
+Y el modelado de incertidumbre aportan valor incremental.
+
+Uso:
+    python baseline.py --data-pattern "traces_data/*.pkl" --scores-file ground_truth_scores.csv --epochs 50
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv, GINEConv, global_mean_pool
+from torch_geometric.loader import DataLoader as PyGDataLoader
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import argparse
+from tqdm import tqdm
+import json
+from datetime import datetime
+
 from dataloader import TraceGraphDataset
+
+
+# ============================================================================
+# MODELO 1: LSTM-solo (Baseline sin estructura)
+# ============================================================================
+
+class LSTMBaseline(nn.Module):
+    """
+    Baseline: Solo LSTM sobre la secuencia de capas.
+    
+    Ignora completamente la estructura del grafo. Cada capa se representa
+    por la media de sus hidden states, creando una secuencia temporal.
+    
+    Input: Secuencia de num_layers vectores (cada uno de dim hidden_dim)
+    Output: Score de hallucination
+    """
+    def __init__(self, hidden_dim, lstm_hidden=256, num_lstm_layers=2, dropout=0.3):
+        super().__init__()
+        
+        self.hidden_dim = hidden_dim
+        self.lstm_hidden = lstm_hidden
+        
+        # LSTM bidireccional para capturar dependencias en ambas direcciones
+        self.lstm = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=lstm_hidden,
+            num_layers=num_lstm_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_lstm_layers > 1 else 0
+        )
+        
+        # Capas de clasificación
+        self.fc1 = nn.Linear(lstm_hidden * 2, 128)  # *2 por bidireccional
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 1)
+        
+    def forward(self, layer_sequence):
+        """
+        Args:
+            layer_sequence: Tensor [batch_size, num_layers, hidden_dim]
+        Returns:
+            scores: Tensor [batch_size, 1]
+        """
+        # LSTM sobre la secuencia de capas
+        lstm_out, (h_n, c_n) = self.lstm(layer_sequence)
+        
+        # Usar el último estado oculto (concatenado de ambas direcciones)
+        # h_n shape: [num_layers*2, batch_size, lstm_hidden]
+        final_hidden = torch.cat([h_n[-2], h_n[-1]], dim=1)  # [batch_size, lstm_hidden*2]
+        
+        # Clasificación
+        x = F.relu(self.fc1(final_hidden))
+        x = self.dropout(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout(x)
+        score = self.fc3(x)  # [batch_size, 1]
+        
+        return score
+
+
+# ============================================================================
+# MODELO 2: GNN-det+LSTM (CHARM-style con estructura determinista)
+# ============================================================================
+
+class GNNDetLSTM(nn.Module):
+    """
+    GNN determinista + LSTM: Procesa la estructura del grafo en cada capa,
+    luego usa LSTM para capturar la dinámica temporal entre capas.
+    
+    IMPORTANTE: Usa edge_attr (pesos de atención) en las capas GNN.
+    
+    Similar a CHARM pero simplificado para ablación limpia.
+    
+    Pipeline:
+    1. Para cada capa: GINE (con edge features) extrae representación considerando estructura Y pesos
+    2. Secuencia de representaciones por capa → LSTM
+    3. Clasificación final
+    """
+    def __init__(self, hidden_dim, gnn_hidden=128, lstm_hidden=256, 
+                 num_lstm_layers=2, dropout=0.3):
+        super().__init__()
+        
+        self.hidden_dim = hidden_dim
+        self.gnn_hidden = gnn_hidden
+        
+        # GINE para procesar estructura del grafo CON edge features (pesos de atención)
+        # GINEConv: Graph Isomorphism Network with Edge Features
+        self.conv1 = GINEConv(
+            nn.Sequential(
+                nn.Linear(hidden_dim, gnn_hidden),
+                nn.ReLU(),
+                nn.Linear(gnn_hidden, gnn_hidden)
+            ),
+            edge_dim=1  # edge_attr es 1-dimensional (valor de atención)
+        )
+        
+        self.conv2 = GINEConv(
+            nn.Sequential(
+                nn.Linear(gnn_hidden, gnn_hidden),
+                nn.ReLU(),
+                nn.Linear(gnn_hidden, gnn_hidden)
+            ),
+            edge_dim=1
+        )
+        
+        # LSTM sobre la secuencia de representaciones de grafos
+        self.lstm = nn.LSTM(
+            input_size=gnn_hidden,
+            hidden_size=lstm_hidden,
+            num_layers=num_lstm_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_lstm_layers > 1 else 0
+        )
+        
+        # Clasificación
+        self.fc1 = nn.Linear(lstm_hidden * 2, 128)
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 1)
+        
+    def forward(self, batched_graphs_by_layer, num_layers):
+        """
+        Args:
+            batched_graphs_by_layer: Lista de PyG Data objects, uno por capa
+            num_layers: Número de capas
+        Returns:
+            scores: Tensor [batch_size, 1]
+        """
+        layer_representations = []
+        
+        # Procesar cada capa con GINE (usando edge_attr)
+        for layer_data in batched_graphs_by_layer:
+            x, edge_index, edge_attr, batch = (
+                layer_data.x, 
+                layer_data.edge_index, 
+                layer_data.edge_attr,  # ← AHORA USAMOS ESTO
+                layer_data.batch
+            )
+            
+            # Asegurar que edge_attr tenga la forma correcta [num_edges, 1]
+            if edge_attr.dim() == 1:
+                edge_attr = edge_attr.unsqueeze(1)
+            
+            # GINE encoding: propaga información considerando pesos de atención
+            x = F.relu(self.conv1(x, edge_index, edge_attr))
+            x = F.dropout(x, p=0.2, training=self.training)
+            x = self.conv2(x, edge_index, edge_attr)
+            
+            # Global pooling: un vector por grafo en el batch
+            graph_repr = global_mean_pool(x, batch)  # [batch_size, gnn_hidden]
+            layer_representations.append(graph_repr)
+        
+        # Stack para crear secuencia temporal
+        # [batch_size, num_layers, gnn_hidden]
+        layer_sequence = torch.stack(layer_representations, dim=1)
+        
+        # LSTM sobre la secuencia
+        lstm_out, (h_n, c_n) = self.lstm(layer_sequence)
+        final_hidden = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        
+        # Clasificación
+        x = F.relu(self.fc1(final_hidden))
+        x = self.dropout(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout(x)
+        score = self.fc3(x)
+        
+        return score
+
+
+# ============================================================================
+# MODELO 3: GVAE+LSTM (Propuesto: Estructura + Incertidumbre Variacional)
+# ============================================================================
+
+class GVAELSTM(nn.Module):
+    """
+    Graph Variational Autoencoder + LSTM: Modela la incertidumbre en la
+    representación del grafo usando un enfoque variacional.
+    
+    IMPORTANTE: Usa edge_attr (pesos de atención) en las capas GNN.
+    
+    Pipeline:
+    1. Para cada capa: GVAE encoder (con edge features) → distribución latente z ~ N(μ, σ²)
+    2. Sampling de z (reparameterization trick)
+    3. Secuencia de z's → LSTM
+    4. Clasificación + pérdida de reconstrucción (regularización)
+    
+    La incertidumbre capturada puede ayudar a detectar alucinaciones.
+    """
+    def __init__(self, hidden_dim, gnn_hidden=128, latent_dim=64, 
+                 lstm_hidden=256, num_lstm_layers=2, dropout=0.3):
+        super().__init__()
+        
+        self.hidden_dim = hidden_dim
+        self.gnn_hidden = gnn_hidden
+        self.latent_dim = latent_dim
+        
+        # GVAE Encoder: GINE (con edge features) + proyección a distribución
+        self.conv1 = GINEConv(
+            nn.Sequential(
+                nn.Linear(hidden_dim, gnn_hidden),
+                nn.ReLU(),
+                nn.Linear(gnn_hidden, gnn_hidden)
+            ),
+            edge_dim=1  # edge_attr es 1-dimensional (valor de atención)
+        )
+        
+        self.conv2 = GINEConv(
+            nn.Sequential(
+                nn.Linear(gnn_hidden, gnn_hidden),
+                nn.ReLU(),
+                nn.Linear(gnn_hidden, gnn_hidden)
+            ),
+            edge_dim=1
+        )
+        
+        # Proyecciones a parámetros de la distribución latente
+        self.fc_mu = nn.Linear(gnn_hidden, latent_dim)
+        self.fc_logvar = nn.Linear(gnn_hidden, latent_dim)
+        
+        # GVAE Decoder (para regularización)
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, gnn_hidden),
+            nn.ReLU(),
+            nn.Linear(gnn_hidden, gnn_hidden)
+        )
+        
+        # LSTM sobre secuencia de representaciones latentes
+        self.lstm = nn.LSTM(
+            input_size=latent_dim,
+            hidden_size=lstm_hidden,
+            num_layers=num_lstm_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_lstm_layers > 1 else 0
+        )
+        
+        # Clasificación
+        self.fc1 = nn.Linear(lstm_hidden * 2, 128)
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 1)
+        
+    def encode(self, x, edge_index, edge_attr, batch):
+        """Encoder: grafo (con edge features) → distribución latente"""
+        # Asegurar que edge_attr tenga la forma correcta [num_edges, 1]
+        if edge_attr.dim() == 1:
+            edge_attr = edge_attr.unsqueeze(1)
+        
+        # GINE: usa edge features (pesos de atención)
+        x = F.relu(self.conv1(x, edge_index, edge_attr))
+        x = F.dropout(x, p=0.2, training=self.training)
+        x = self.conv2(x, edge_index, edge_attr)
+        
+        # Global pooling
+        graph_repr = global_mean_pool(x, batch)
+        
+        # Parámetros de la distribución
+        mu = self.fc_mu(graph_repr)
+        logvar = self.fc_logvar(graph_repr)
+        
+        return mu, logvar, graph_repr
+    
+    def reparameterize(self, mu, logvar):
+        """Reparameterization trick: z = μ + σ * ε, donde ε ~ N(0,1)"""
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def decode(self, z):
+        """Decoder: representación latente → reconstrucción"""
+        return self.decoder(z)
+    
+    def forward(self, batched_graphs_by_layer, num_layers):
+        """
+        Args:
+            batched_graphs_by_layer: Lista de PyG Data objects
+            num_layers: Número de capas
+        Returns:
+            scores: Tensor [batch_size, 1]
+            mu_list: Lista de tensores mu (para KL loss)
+            logvar_list: Lista de tensores logvar (para KL loss)
+            original_reprs: Lista de representaciones originales (para reconstruction loss)
+            reconstructed_reprs: Lista de reconstrucciones
+        """
+        latent_sequence = []
+        mu_list = []
+        logvar_list = []
+        original_reprs = []
+        reconstructed_reprs = []
+        
+        # Procesar cada capa con GVAE (usando edge_attr)
+        for layer_data in batched_graphs_by_layer:
+            x, edge_index, edge_attr, batch = (
+                layer_data.x, 
+                layer_data.edge_index, 
+                layer_data.edge_attr,  # ← AHORA USAMOS ESTO
+                layer_data.batch
+            )
+            
+            # Encode (con edge features)
+            mu, logvar, graph_repr = self.encode(x, edge_index, edge_attr, batch)
+            
+            # Reparameterize
+            z = self.reparameterize(mu, logvar)
+            
+            # Decode (para pérdida de reconstrucción)
+            x_reconstructed = self.decode(z)
+            
+            # Guardar para pérdidas
+            mu_list.append(mu)
+            logvar_list.append(logvar)
+            original_reprs.append(graph_repr)
+            reconstructed_reprs.append(x_reconstructed)
+            
+            latent_sequence.append(z)
+        
+        # Secuencia latente
+        latent_seq = torch.stack(latent_sequence, dim=1)  # [batch_size, num_layers, latent_dim]
+        
+        # LSTM
+        lstm_out, (h_n, c_n) = self.lstm(latent_seq)
+        final_hidden = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        
+        # Clasificación
+        x = F.relu(self.fc1(final_hidden))
+        x = self.dropout(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout(x)
+        score = self.fc3(x)
+        
+        return score, mu_list, logvar_list, original_reprs, reconstructed_reprs
+
+
+# ============================================================================
+# FUNCIONES DE PÉRDIDA
+# ============================================================================
+
+def vae_loss(recon_x, x, mu, logvar, kl_weight=0.001):
+    """
+    Pérdida VAE = Reconstruction Loss + KL Divergence
+    
+    Args:
+        recon_x: Reconstrucciones
+        x: Originales
+        mu: Medias de la distribución latente
+        logvar: Log-varianzas de la distribución latente
+        kl_weight: Peso para la divergencia KL
+    """
+    # Reconstruction loss (MSE)
+    recon_loss = F.mse_loss(recon_x, x, reduction='sum')
+    
+    # KL divergence: -0.5 * sum(1 + log(σ²) - μ² - σ²)
+    kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    
+    return recon_loss + kl_weight * kld
+
+
+# ============================================================================
+# DATASET Y LOADERS PERSONALIZADOS
+# ============================================================================
+
+class SequentialTraceDataset:
+    """
+    Dataset que organiza grafos por trace completo (todas las capas juntas)
+    en lugar de grafos individuales.
+    """
+    def __init__(self, pkl_files_pattern, scores_file, attn_threshold=0.01):
+        from dataloader import TraceGraphDataset
+        
+        # Cargar dataset de grafos
+        self.graph_dataset = TraceGraphDataset(pkl_files_pattern, attn_threshold)
+        
+        # Cargar scores
+        scores_df = pd.read_csv(scores_file)
+        self.scores_dict = dict(zip(scores_df['question_id'], scores_df['bleurt_score']))
+        
+        self.num_layers = self.graph_dataset.num_layers
+        self.num_traces = len(self.graph_dataset.all_traces)
+        
+        print(f"Dataset secuencial creado:")
+        print(f"  - {self.num_traces} traces")
+        print(f"  - {self.num_layers} capas por trace")
+        print(f"  - {len(self.scores_dict)} scores cargados")
+    
+    def __len__(self):
+        return self.num_traces
+    
+    def __getitem__(self, trace_idx):
+        """
+        Retorna todos los grafos de un trace (una por capa) + score.
+        
+        Returns:
+            graphs_by_layer: Lista de Data objects
+            score: Score BLEURT
+            question_id: ID de la pregunta
+        """
+        graphs_by_layer = []
+        question_id = None
+        
+        for layer_idx in range(self.num_layers):
+            # Calcular índice global en el dataset plano
+            global_idx = trace_idx * self.num_layers + layer_idx
+            graph = self.graph_dataset[global_idx]
+            graphs_by_layer.append(graph)
+            
+            if question_id is None:
+                question_id = graph.question_id
+        
+        # Obtener score
+        score = self.scores_dict.get(question_id, 0.0)
+        
+        return graphs_by_layer, torch.tensor(score, dtype=torch.float), question_id
+
+
+def collate_sequential_batch(batch):
+    """
+    Collate function para organizar batches de secuencias de grafos.
+    
+    Args:
+        batch: Lista de (graphs_by_layer, score, question_id)
+    
+    Returns:
+        batched_by_layer: Lista de num_layers batches de PyG
+        scores: Tensor de scores
+        question_ids: Lista de IDs
+    """
+    from torch_geometric.data import Batch as PyGBatch
+    
+    batch_size = len(batch)
+    num_layers = len(batch[0][0])
+    
+    # Reorganizar: en lugar de [batch][layer], queremos [layer][batch]
+    batched_by_layer = []
+    for layer_idx in range(num_layers):
+        layer_graphs = [item[0][layer_idx] for item in batch]
+        batched_layer = PyGBatch.from_data_list(layer_graphs)
+        batched_by_layer.append(batched_layer)
+    
+    scores = torch.stack([item[1] for item in batch])
+    question_ids = [item[2] for item in batch]
+    
+    return batched_by_layer, scores, question_ids
+
+
+# ============================================================================
+# ENTRENAMIENTO Y EVALUACIÓN
+# ============================================================================
+
+def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0.001):
+    """Entrena el modelo LSTM Baseline"""
+    model = model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    criterion = nn.MSELoss()
+    
+    history = {'train_loss': [], 'val_loss': [], 'val_mae': []}
+    best_val_loss = float('inf')
+    
+    for epoch in range(epochs):
+        # Training
+        model.train()
+        train_loss = 0
+        for batched_by_layer, scores, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            scores = scores.to(device).unsqueeze(1)
+            
+            # Extraer secuencia: promediar nodos de cada grafo en cada capa
+            layer_sequence = []
+            for layer_data in batched_by_layer:
+                # Promedio global de nodos por grafo
+                from torch_geometric.nn import global_mean_pool
+                layer_repr = global_mean_pool(layer_data.x.to(device), 
+                                              layer_data.batch.to(device))
+                layer_sequence.append(layer_repr)
+            
+            layer_sequence = torch.stack(layer_sequence, dim=1)  # [batch, layers, dim]
+            
+            optimizer.zero_grad()
+            predictions = model(layer_sequence)
+            loss = criterion(predictions, scores)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+        
+        # Validation
+        model.eval()
+        val_loss = 0
+        val_mae = 0
+        with torch.no_grad():
+            for batched_by_layer, scores, _ in val_loader:
+                scores = scores.to(device).unsqueeze(1)
+                
+                layer_sequence = []
+                for layer_data in batched_by_layer:
+                    from torch_geometric.nn import global_mean_pool
+                    layer_repr = global_mean_pool(layer_data.x.to(device),
+                                                  layer_data.batch.to(device))
+                    layer_sequence.append(layer_repr)
+                
+                layer_sequence = torch.stack(layer_sequence, dim=1)
+                predictions = model(layer_sequence)
+                
+                loss = criterion(predictions, scores)
+                mae = torch.abs(predictions - scores).mean()
+                
+                val_loss += loss.item()
+                val_mae += mae.item()
+        
+        train_loss /= len(train_loader)
+        val_loss /= len(val_loader)
+        val_mae /= len(val_loader)
+        
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['val_mae'].append(val_mae)
+        
+        print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, Val MAE={val_mae:.4f}")
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), 'best_lstm_baseline.pt')
+    
+    return history
+
+
+def train_gnn_det_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.001):
+    """Entrena el modelo GNN-det+LSTM"""
+    model = model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    criterion = nn.MSELoss()
+    
+    history = {'train_loss': [], 'val_loss': [], 'val_mae': []}
+    best_val_loss = float('inf')
+    
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0
+        for batched_by_layer, scores, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            scores = scores.to(device).unsqueeze(1)
+            
+            # Mover datos a device
+            batched_by_layer = [data.to(device) for data in batched_by_layer]
+            
+            optimizer.zero_grad()
+            predictions = model(batched_by_layer, len(batched_by_layer))
+            loss = criterion(predictions, scores)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+        
+        model.eval()
+        val_loss = 0
+        val_mae = 0
+        with torch.no_grad():
+            for batched_by_layer, scores, _ in val_loader:
+                scores = scores.to(device).unsqueeze(1)
+                batched_by_layer = [data.to(device) for data in batched_by_layer]
+                
+                predictions = model(batched_by_layer, len(batched_by_layer))
+                loss = criterion(predictions, scores)
+                mae = torch.abs(predictions - scores).mean()
+                
+                val_loss += loss.item()
+                val_mae += mae.item()
+        
+        train_loss /= len(train_loader)
+        val_loss /= len(val_loader)
+        val_mae /= len(val_loader)
+        
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['val_mae'].append(val_mae)
+        
+        print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, Val MAE={val_mae:.4f}")
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), 'best_gnn_det_lstm.pt')
+    
+    return history
+
+
+def train_gvae_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.001, kl_weight=0.001):
+    """Entrena el modelo GVAE+LSTM"""
+    model = model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    criterion = nn.MSELoss()
+    
+    history = {'train_loss': [], 'train_task_loss': [], 'train_vae_loss': [],
+               'val_loss': [], 'val_mae': []}
+    best_val_loss = float('inf')
+    
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0
+        train_task_loss = 0
+        train_vae_loss = 0
+        
+        for batched_by_layer, scores, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            scores = scores.to(device).unsqueeze(1)
+            batched_by_layer = [data.to(device) for data in batched_by_layer]
+            
+            optimizer.zero_grad()
+            predictions, mu_list, logvar_list, orig_list, recon_list = model(
+                batched_by_layer, len(batched_by_layer)
+            )
+            
+            # Pérdida de la tarea principal
+            task_loss = criterion(predictions, scores)
+            
+            # Pérdida VAE acumulada sobre todas las capas
+            vae_loss_total = 0
+            for mu, logvar, orig, recon in zip(mu_list, logvar_list, orig_list, recon_list):
+                vae_loss_total += vae_loss(recon, orig, mu, logvar, kl_weight)
+            vae_loss_total /= len(mu_list)
+            
+            # Pérdida total
+            loss = task_loss + 0.1 * vae_loss_total  # Peso reducido para VAE
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            train_task_loss += task_loss.item()
+            train_vae_loss += vae_loss_total.item()
+        
+        model.eval()
+        val_loss = 0
+        val_mae = 0
+        with torch.no_grad():
+            for batched_by_layer, scores, _ in val_loader:
+                scores = scores.to(device).unsqueeze(1)
+                batched_by_layer = [data.to(device) for data in batched_by_layer]
+                
+                predictions, _, _, _, _ = model(batched_by_layer, len(batched_by_layer))
+                loss = criterion(predictions, scores)
+                mae = torch.abs(predictions - scores).mean()
+                
+                val_loss += loss.item()
+                val_mae += mae.item()
+        
+        train_loss /= len(train_loader)
+        train_task_loss /= len(train_loader)
+        train_vae_loss /= len(train_loader)
+        val_loss /= len(val_loader)
+        val_mae /= len(val_loader)
+        
+        history['train_loss'].append(train_loss)
+        history['train_task_loss'].append(train_task_loss)
+        history['train_vae_loss'].append(train_vae_loss)
+        history['val_loss'].append(val_loss)
+        history['val_mae'].append(val_mae)
+        
+        print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f} (Task={train_task_loss:.4f}, VAE={train_vae_loss:.4f}), Val Loss={val_loss:.4f}, Val MAE={val_mae:.4f}")
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), 'best_gvae_lstm.pt')
+    
+    return history
+
+
+# ============================================================================
+# FUNCIÓN PRINCIPAL: EXPERIMENTOS DE ABLACIÓN
+# ============================================================================
+
+def run_ablation_experiments(args):
+    """
+    Ejecuta los 3 experimentos de ablación y compara resultados.
+    """
+    print("="*80)
+    print("EXPERIMENTOS DE ABLACIÓN - PRUEBA DE HIPÓTESIS")
+    print("="*80)
+    print("\nHipótesis: La dinámica estructural secuencial a través de las capas")
+    print("           es la señal clave para detectar alucinaciones.")
+    print("\nModelos a comparar:")
+    print("  1. LSTM-solo (Baseline sin estructura)")
+    print("  2. GNN-det+LSTM (Con estructura determinista)")
+    print("  3. GVAE+LSTM (Con estructura + incertidumbre variacional)")
+    print("\nEsperado: GVAE+LSTM > GNN-det+LSTM > LSTM-solo")
+    print("="*80)
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"\nDispositivo: {device}")
+    
+    # Crear dataset
+    print("\nCargando dataset...")
+    full_dataset = SequentialTraceDataset(
+        args.data_pattern,
+        args.scores_file,
+        attn_threshold=args.attn_threshold
+    )
+    
+    # Split train/val/test
+    total_size = len(full_dataset)
+    train_size = int(0.7 * total_size)
+    val_size = int(0.15 * total_size)
+    test_size = total_size - train_size - val_size
+    
+    from torch.utils.data import random_split
+    train_dataset, val_dataset, test_dataset = random_split(
+        full_dataset, [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+    
+    print(f"\nSplit del dataset:")
+    print(f"  Train: {len(train_dataset)}")
+    print(f"  Val: {len(val_dataset)}")
+    print(f"  Test: {len(test_dataset)}")
+    
+    # Crear dataloaders
+    from torch.utils.data import DataLoader
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
+                              shuffle=True, collate_fn=collate_sequential_batch)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
+                            shuffle=False, collate_fn=collate_sequential_batch)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
+                             shuffle=False, collate_fn=collate_sequential_batch)
+    
+    # Obtener dimensiones
+    sample_graph = full_dataset[0][0][0]
+    hidden_dim = sample_graph.x.shape[1]
+    print(f"\nDimensión de hidden states: {hidden_dim}")
+    
+    results = {}
+    
+    # ========================================================================
+    # EXPERIMENTO 1: LSTM Baseline
+    # ========================================================================
+    if args.run_lstm:
+        print("\n" + "="*80)
+        print("EXPERIMENTO 1: LSTM-solo (Baseline)")
+        print("="*80)
+        
+        model_lstm = LSTMBaseline(
+            hidden_dim=hidden_dim,
+            lstm_hidden=args.lstm_hidden,
+            num_lstm_layers=args.num_lstm_layers,
+            dropout=args.dropout
+        )
+        
+        print(f"Parámetros del modelo: {sum(p.numel() for p in model_lstm.parameters()):,}")
+        
+        history_lstm = train_lstm_baseline(
+            model_lstm, train_loader, val_loader, device,
+            epochs=args.epochs, lr=args.lr
+        )
+        
+        results['LSTM-solo'] = {
+            'best_val_loss': min(history_lstm['val_loss']),
+            'best_val_mae': min(history_lstm['val_mae']),
+            'history': history_lstm
+        }
+    
+    # ========================================================================
+    # EXPERIMENTO 2: GNN-det+LSTM
+    # ========================================================================
+    if args.run_gnn_det:
+        print("\n" + "="*80)
+        print("EXPERIMENTO 2: GNN-det+LSTM (CHARM-style)")
+        print("="*80)
+        
+        model_gnn = GNNDetLSTM(
+            hidden_dim=hidden_dim,
+            gnn_hidden=args.gnn_hidden,
+            lstm_hidden=args.lstm_hidden,
+            num_lstm_layers=args.num_lstm_layers,
+            dropout=args.dropout
+        )
+        
+        print(f"Parámetros del modelo: {sum(p.numel() for p in model_gnn.parameters()):,}")
+        
+        history_gnn = train_gnn_det_lstm(
+            model_gnn, train_loader, val_loader, device,
+            epochs=args.epochs, lr=args.lr
+        )
+        
+        results['GNN-det+LSTM'] = {
+            'best_val_loss': min(history_gnn['val_loss']),
+            'best_val_mae': min(history_gnn['val_mae']),
+            'history': history_gnn
+        }
+    
+    # ========================================================================
+    # EXPERIMENTO 3: GVAE+LSTM
+    # ========================================================================
+    if args.run_gvae:
+        print("\n" + "="*80)
+        print("EXPERIMENTO 3: GVAE+LSTM (Propuesto)")
+        print("="*80)
+        
+        model_gvae = GVAELSTM(
+            hidden_dim=hidden_dim,
+            gnn_hidden=args.gnn_hidden,
+            latent_dim=args.latent_dim,
+            lstm_hidden=args.lstm_hidden,
+            num_lstm_layers=args.num_lstm_layers,
+            dropout=args.dropout
+        )
+        
+        print(f"Parámetros del modelo: {sum(p.numel() for p in model_gvae.parameters()):,}")
+        
+        history_gvae = train_gvae_lstm(
+            model_gvae, train_loader, val_loader, device,
+            epochs=args.epochs, lr=args.lr, kl_weight=args.kl_weight
+        )
+        
+        results['GVAE+LSTM'] = {
+            'best_val_loss': min(history_gvae['val_loss']),
+            'best_val_mae': min(history_gvae['val_mae']),
+            'history': history_gvae
+        }
+    
+    # ========================================================================
+    # RESULTADOS Y CONCLUSIONES
+    # ========================================================================
+    print("\n" + "="*80)
+    print("RESULTADOS FINALES - TABLA DE ABLACIÓN")
+    print("="*80)
+    
+    print("\nMétrica: Validation Loss (MSE) - Menor es mejor")
+    print("-" * 60)
+    print(f"{'Modelo':<25} {'Best Val Loss':>15} {'Best Val MAE':>15}")
+    print("-" * 60)
+    
+    for model_name, metrics in sorted(results.items(), key=lambda x: x[1]['best_val_loss']):
+        print(f"{model_name:<25} {metrics['best_val_loss']:>15.4f} {metrics['best_val_mae']:>15.4f}")
+    
+    print("-" * 60)
+    
+    # Verificar hipótesis
+    print("\n" + "="*80)
+    print("VERIFICACIÓN DE HIPÓTESIS")
+    print("="*80)
+    
+    if len(results) == 3:
+        lstm_loss = results['LSTM-solo']['best_val_loss']
+        gnn_loss = results['GNN-det+LSTM']['best_val_loss']
+        gvae_loss = results['GVAE+LSTM']['best_val_loss']
+        
+        print(f"\nLSTM-solo:     {lstm_loss:.4f}")
+        print(f"GNN-det+LSTM:  {gnn_loss:.4f} ({'✓' if gnn_loss < lstm_loss else '✗'} mejor que LSTM-solo)")
+        print(f"GVAE+LSTM:     {gvae_loss:.4f} ({'✓' if gvae_loss < gnn_loss else '✗'} mejor que GNN-det+LSTM)")
+        
+        if gvae_loss < gnn_loss < lstm_loss:
+            print("\n🎉 HIPÓTESIS CONFIRMADA:")
+            print("   GVAE+LSTM > GNN-det+LSTM > LSTM-solo")
+            print("   La estructura del grafo Y la incertidumbre variacional aportan valor.")
+        elif gnn_loss < lstm_loss:
+            print("\n⚠️  HIPÓTESIS PARCIALMENTE CONFIRMADA:")
+            print("   La estructura del grafo aporta valor, pero la incertidumbre")
+            print("   variacional no mejora significativamente.")
+        else:
+            print("\n❌ HIPÓTESIS NO CONFIRMADA:")
+            print("   Los resultados sugieren revisar la arquitectura o hiperparámetros.")
+    
+    # Guardar resultados
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_file = output_dir / f"ablation_results_{timestamp}.json"
+    
+    # Convertir historia a listas para JSON
+    results_json = {}
+    for model_name, metrics in results.items():
+        results_json[model_name] = {
+            'best_val_loss': metrics['best_val_loss'],
+            'best_val_mae': metrics['best_val_mae'],
+            'history': {k: v for k, v in metrics['history'].items()}
+        }
+    
+    with open(results_file, 'w') as f:
+        json.dump(results_json, f, indent=2)
+    
+    print(f"\n✅ Resultados guardados en: {results_file}")
+    print("\n" + "="*80)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description="Experimentos de ablación para detección de alucinaciones"
+    )
+    
+    # Datos
+    parser.add_argument('--data-pattern', type=str, required=True,
+                       help='Patrón glob para archivos .pkl (ej: "traces_data/*.pkl")')
+    parser.add_argument('--scores-file', type=str, required=True,
+                       help='Archivo CSV con scores BLEURT')
+    parser.add_argument('--attn-threshold', type=float, default=0.01,
+                       help='Umbral de atención para crear arcos')
+    
+    # Entrenamiento
+    parser.add_argument('--epochs', type=int, default=50,
+                       help='Número de épocas')
+    parser.add_argument('--batch-size', type=int, default=16,
+                       help='Tamaño del batch')
+    parser.add_argument('--lr', type=float, default=0.001,
+                       help='Learning rate')
+    
+    # Arquitectura
+    parser.add_argument('--gnn-hidden', type=int, default=128,
+                       help='Dimensión oculta de GNN')
+    parser.add_argument('--latent-dim', type=int, default=64,
+                       help='Dimensión latente para GVAE')
+    parser.add_argument('--lstm-hidden', type=int, default=256,
+                       help='Dimensión oculta de LSTM')
+    parser.add_argument('--num-lstm-layers', type=int, default=2,
+                       help='Número de capas LSTM')
+    parser.add_argument('--dropout', type=float, default=0.3,
+                       help='Dropout rate')
+    parser.add_argument('--kl-weight', type=float, default=0.001,
+                       help='Peso para pérdida KL en GVAE')
+    
+    # Control de experimentos
+    parser.add_argument('--run-lstm', action='store_true', default=True,
+                       help='Ejecutar experimento LSTM-solo')
+    parser.add_argument('--run-gnn-det', action='store_true', default=True,
+                       help='Ejecutar experimento GNN-det+LSTM')
+    parser.add_argument('--run-gvae', action='store_true', default=True,
+                       help='Ejecutar experimento GVAE+LSTM')
+    parser.add_argument('--output-dir', type=str, default='./ablation_results',
+                       help='Directorio para guardar resultados')
+    
+    args = parser.parse_args()
+    
+    run_ablation_experiments(args)
