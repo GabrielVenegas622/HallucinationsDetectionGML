@@ -213,7 +213,7 @@ def main():
             
             # Mostrar 5 ejemplos de este batch
             print(f"\n   --- 5 Ejemplos del batch {batch_idx} ---")
-            for i in range(min(5, len(traces))):
+            for i in range(min(25, len(traces))):
                 trace = traces[i]
                 question_id = trace.get('question_id', 'N/A')
                 num_tokens = len(trace['tokens'])

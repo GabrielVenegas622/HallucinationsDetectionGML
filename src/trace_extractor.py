@@ -167,7 +167,7 @@ def main(args):
     dataset_name = args.dataset.lower()
     
     # Configuración de batches para gestión de memoria
-    BATCH_SIZE = 500
+    BATCH_SIZE = 1_000
     
     print(f"Cargando modelo: {model_load}")
     tokenizer = AutoTokenizer.from_pretrained(model_load)
