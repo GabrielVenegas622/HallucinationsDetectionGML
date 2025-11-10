@@ -13,8 +13,13 @@ HIPÓTESIS A PROBAR:
 Si GVAE+LSTM > GNN-det+LSTM > LSTM-solo, entonces la estructura del grafo
 Y el modelado de incertidumbre aportan valor incremental.
 
+METODOLOGÍA HaloScope:
+- Aplicar threshold sobre scores BLEURT para obtener etiquetas binarias (0/1)
+- Usar Binary Cross Entropy como función de pérdida
+- AUROC como métrica principal de evaluación
+
 Uso:
-    python baseline.py --data-pattern "traces_data/*.pkl" --scores-file ground_truth_scores.csv --epochs 50
+    python baseline.py --data-pattern "traces_data/*.pkl" --scores-file ground_truth_scores.csv --epochs 50 --score-threshold 0.5
 """
 
 import torch
@@ -29,6 +34,7 @@ import argparse
 from tqdm import tqdm
 import json
 from datetime import datetime
+from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, accuracy_score, precision_score, recall_score, f1_score
 
 from dataloader import TraceGraphDataset
 
@@ -74,7 +80,7 @@ class LSTMBaseline(nn.Module):
         Args:
             layer_sequence: Tensor [batch_size, num_layers, hidden_dim]
         Returns:
-            scores: Tensor [batch_size, 1]
+            logits: Tensor [batch_size, 1] - logits para clasificación binaria
         """
         # LSTM sobre la secuencia de capas
         lstm_out, (h_n, c_n) = self.lstm(layer_sequence)
@@ -83,14 +89,14 @@ class LSTMBaseline(nn.Module):
         # h_n shape: [num_layers*2, batch_size, lstm_hidden]
         final_hidden = torch.cat([h_n[-2], h_n[-1]], dim=1)  # [batch_size, lstm_hidden*2]
         
-        # Clasificación
+        # Clasificación binaria
         x = F.relu(self.fc1(final_hidden))
         x = self.dropout(x)
         x = F.relu(self.fc2(x))
         x = self.dropout(x)
-        score = self.fc3(x)  # [batch_size, 1]
+        logits = self.fc3(x)  # [batch_size, 1] - sin sigmoid, se aplica en la loss
         
-        return score
+        return logits
 
 
 # ============================================================================
@@ -160,7 +166,7 @@ class GNNDetLSTM(nn.Module):
             batched_graphs_by_layer: Lista de PyG Data objects, uno por capa
             num_layers: Número de capas
         Returns:
-            scores: Tensor [batch_size, 1]
+            logits: Tensor [batch_size, 1] - logits para clasificación binaria
         """
         layer_representations = []
         
@@ -194,14 +200,14 @@ class GNNDetLSTM(nn.Module):
         lstm_out, (h_n, c_n) = self.lstm(layer_sequence)
         final_hidden = torch.cat([h_n[-2], h_n[-1]], dim=1)
         
-        # Clasificación
+        # Clasificación binaria
         x = F.relu(self.fc1(final_hidden))
         x = self.dropout(x)
         x = F.relu(self.fc2(x))
         x = self.dropout(x)
-        score = self.fc3(x)
+        logits = self.fc3(x)  # [batch_size, 1] - sin sigmoid, se aplica en la loss
         
-        return score
+        return logits
 
 
 # ============================================================================
@@ -313,7 +319,7 @@ class GVAELSTM(nn.Module):
             batched_graphs_by_layer: Lista de PyG Data objects
             num_layers: Número de capas
         Returns:
-            scores: Tensor [batch_size, 1]
+            logits: Tensor [batch_size, 1] - logits para clasificación binaria
             mu_list: Lista de tensores mu (para KL loss)
             logvar_list: Lista de tensores logvar (para KL loss)
             original_reprs: Lista de representaciones originales (para reconstruction loss)
@@ -358,14 +364,14 @@ class GVAELSTM(nn.Module):
         lstm_out, (h_n, c_n) = self.lstm(latent_seq)
         final_hidden = torch.cat([h_n[-2], h_n[-1]], dim=1)
         
-        # Clasificación
+        # Clasificación binaria
         x = F.relu(self.fc1(final_hidden))
         x = self.dropout(x)
         x = F.relu(self.fc2(x))
         x = self.dropout(x)
-        score = self.fc3(x)
+        logits = self.fc3(x)  # [batch_size, 1] - sin sigmoid, se aplica en la loss
         
-        return score, mu_list, logvar_list, original_reprs, reconstructed_reprs
+        return logits, mu_list, logvar_list, original_reprs, reconstructed_reprs
 
 
 # ============================================================================
@@ -400,35 +406,57 @@ class SequentialTraceDataset:
     """
     Dataset que organiza grafos por trace completo (todas las capas juntas)
     en lugar de grafos individuales.
+    
+    Aplica threshold sobre scores BLEURT para obtener etiquetas binarias:
+    - label = 1 si score < threshold (alucinación)
+    - label = 0 si score >= threshold (no alucinación)
     """
-    def __init__(self, pkl_files_pattern, scores_file, attn_threshold=0.01):
+    def __init__(self, pkl_files_pattern, scores_file, attn_threshold=0.01, score_threshold=0.5):
         from dataloader import TraceGraphDataset
         
         # Cargar dataset de grafos
         self.graph_dataset = TraceGraphDataset(pkl_files_pattern, attn_threshold)
         
-        # Cargar scores
+        # Cargar scores y convertir a etiquetas binarias
         scores_df = pd.read_csv(scores_file)
         self.scores_dict = dict(zip(scores_df['question_id'], scores_df['bleurt_score']))
         
+        # Threshold para convertir scores a etiquetas binarias
+        self.score_threshold = score_threshold
+        
+        # Crear diccionario de etiquetas binarias
+        self.labels_dict = {}
+        for qid, score in self.scores_dict.items():
+            # label = 1 si es alucinación (score bajo), 0 si no
+            self.labels_dict[qid] = 1 if score < score_threshold else 0
+        
         self.num_layers = self.graph_dataset.num_layers
         self.num_traces = len(self.graph_dataset.all_traces)
+        
+        # Calcular estadísticas de balance de clases
+        labels_values = list(self.labels_dict.values())
+        num_hallucinations = sum(labels_values)
+        num_correct = len(labels_values) - num_hallucinations
         
         print(f"Dataset secuencial creado:")
         print(f"  - {self.num_traces} traces")
         print(f"  - {self.num_layers} capas por trace")
         print(f"  - {len(self.scores_dict)} scores cargados")
+        print(f"  - Score threshold: {score_threshold}")
+        print(f"  - Balance de clases:")
+        print(f"    * Alucinaciones (1): {num_hallucinations} ({100*num_hallucinations/len(labels_values):.1f}%)")
+        print(f"    * No alucinaciones (0): {num_correct} ({100*num_correct/len(labels_values):.1f}%)")
     
     def __len__(self):
         return self.num_traces
     
     def __getitem__(self, trace_idx):
         """
-        Retorna todos los grafos de un trace (una por capa) + score.
+        Retorna todos los grafos de un trace (una por capa) + etiqueta binaria.
         
         Returns:
             graphs_by_layer: Lista de Data objects
-            score: Score BLEURT
+            label: Etiqueta binaria (0 o 1)
             question_id: ID de la pregunta
         """
         graphs_by_layer = []
@@ -443,10 +471,10 @@ class SequentialTraceDataset:
             if question_id is None:
                 question_id = graph.question_id
         
-        # Obtener score
-        score = self.scores_dict.get(question_id, 0.0)
+        # Obtener etiqueta binaria
+        label = self.labels_dict.get(question_id, 0)
         
-        return graphs_by_layer, torch.tensor(score, dtype=torch.float), question_id
+        return graphs_by_layer, torch.tensor(label, dtype=torch.float), question_id
 
 
 def collate_sequential_batch(batch):
@@ -454,11 +482,11 @@ def collate_sequential_batch(batch):
     Collate function para organizar batches de secuencias de grafos.
     
     Args:
-        batch: Lista de (graphs_by_layer, score, question_id)
+        batch: Lista de (graphs_by_layer, label, question_id)
     
     Returns:
         batched_by_layer: Lista de num_layers batches de PyG
-        scores: Tensor de scores
+        labels: Tensor de etiquetas binarias
         question_ids: Lista de IDs
     """
     from torch_geometric.data import Batch as PyGBatch
@@ -473,10 +501,10 @@ def collate_sequential_batch(batch):
         batched_layer = PyGBatch.from_data_list(layer_graphs)
         batched_by_layer.append(batched_layer)
     
-    scores = torch.stack([item[1] for item in batch])
+    labels = torch.stack([item[1] for item in batch])
     question_ids = [item[2] for item in batch]
     
-    return batched_by_layer, scores, question_ids
+    return batched_by_layer, labels, question_ids
 
 
 # ============================================================================
@@ -484,20 +512,20 @@ def collate_sequential_batch(batch):
 # ============================================================================
 
 def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0.001):
-    """Entrena el modelo LSTM Baseline"""
+    """Entrena el modelo LSTM Baseline con clasificación binaria"""
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    criterion = nn.MSELoss()
+    criterion = nn.BCEWithLogitsLoss()  # BCE con logits (más estable numéricamente)
     
-    history = {'train_loss': [], 'val_loss': [], 'val_mae': []}
-    best_val_loss = float('inf')
+    history = {'train_loss': [], 'val_loss': [], 'val_auroc': [], 'val_acc': [], 'val_f1': []}
+    best_val_auroc = 0.0
     
     for epoch in range(epochs):
         # Training
         model.train()
         train_loss = 0
-        for batched_by_layer, scores, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
-            scores = scores.to(device).unsqueeze(1)
+        for batched_by_layer, labels, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            labels = labels.to(device).unsqueeze(1)
             
             # Extraer secuencia: promediar nodos de cada grafo en cada capa
             layer_sequence = []
@@ -511,8 +539,8 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
             layer_sequence = torch.stack(layer_sequence, dim=1)  # [batch, layers, dim]
             
             optimizer.zero_grad()
-            predictions = model(layer_sequence)
-            loss = criterion(predictions, scores)
+            logits = model(layer_sequence)
+            loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
             
@@ -521,10 +549,13 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
         # Validation
         model.eval()
         val_loss = 0
-        val_mae = 0
+        all_probs = []
+        all_labels = []
+        all_preds = []
+        
         with torch.no_grad():
-            for batched_by_layer, scores, _ in val_loader:
-                scores = scores.to(device).unsqueeze(1)
+            for batched_by_layer, labels, _ in val_loader:
+                labels = labels.to(device).unsqueeze(1)
                 
                 layer_sequence = []
                 for layer_data in batched_by_layer:
@@ -534,52 +565,64 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
                     layer_sequence.append(layer_repr)
                 
                 layer_sequence = torch.stack(layer_sequence, dim=1)
-                predictions = model(layer_sequence)
+                logits = model(layer_sequence)
                 
-                loss = criterion(predictions, scores)
-                mae = torch.abs(predictions - scores).mean()
-                
+                loss = criterion(logits, labels)
                 val_loss += loss.item()
-                val_mae += mae.item()
+                
+                # Calcular probabilidades y predicciones
+                probs = torch.sigmoid(logits)
+                preds = (probs > 0.5).float()
+                
+                all_probs.extend(probs.cpu().numpy().flatten())
+                all_labels.extend(labels.cpu().numpy().flatten())
+                all_preds.extend(preds.cpu().numpy().flatten())
         
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
-        val_mae /= len(val_loader)
+        
+        # Calcular métricas
+        val_auroc = roc_auc_score(all_labels, all_probs)
+        val_acc = accuracy_score(all_labels, all_preds)
+        val_f1 = f1_score(all_labels, all_preds)
         
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
-        history['val_mae'].append(val_mae)
+        history['val_auroc'].append(val_auroc)
+        history['val_acc'].append(val_acc)
+        history['val_f1'].append(val_f1)
         
-        print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, Val MAE={val_mae:.4f}")
+        print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, "
+              f"AUROC={val_auroc:.4f}, Acc={val_acc:.4f}, F1={val_f1:.4f}")
         
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_auroc > best_val_auroc:
+            best_val_auroc = val_auroc
             torch.save(model.state_dict(), 'best_lstm_baseline.pt')
     
     return history
 
 
 def train_gnn_det_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.001):
-    """Entrena el modelo GNN-det+LSTM"""
+    """Entrena el modelo GNN-det+LSTM con clasificación binaria"""
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    criterion = nn.MSELoss()
+    criterion = nn.BCEWithLogitsLoss()
     
-    history = {'train_loss': [], 'val_loss': [], 'val_mae': []}
-    best_val_loss = float('inf')
+    history = {'train_loss': [], 'val_loss': [], 'val_auroc': [], 'val_acc': [], 'val_f1': []}
+    best_val_auroc = 0.0
     
     for epoch in range(epochs):
         model.train()
         train_loss = 0
-        for batched_by_layer, scores, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
-            scores = scores.to(device).unsqueeze(1)
+        for batched_by_layer, labels, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            labels = labels.to(device).unsqueeze(1)
             
             # Mover datos a device
             batched_by_layer = [data.to(device) for data in batched_by_layer]
             
             optimizer.zero_grad()
-            predictions = model(batched_by_layer, len(batched_by_layer))
-            loss = criterion(predictions, scores)
+            logits = model(batched_by_layer, len(batched_by_layer))
+            loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
             
@@ -587,45 +630,60 @@ def train_gnn_det_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.
         
         model.eval()
         val_loss = 0
-        val_mae = 0
+        all_probs = []
+        all_labels = []
+        all_preds = []
+        
         with torch.no_grad():
-            for batched_by_layer, scores, _ in val_loader:
-                scores = scores.to(device).unsqueeze(1)
+            for batched_by_layer, labels, _ in val_loader:
+                labels = labels.to(device).unsqueeze(1)
                 batched_by_layer = [data.to(device) for data in batched_by_layer]
                 
-                predictions = model(batched_by_layer, len(batched_by_layer))
-                loss = criterion(predictions, scores)
-                mae = torch.abs(predictions - scores).mean()
-                
+                logits = model(batched_by_layer, len(batched_by_layer))
+                loss = criterion(logits, labels)
                 val_loss += loss.item()
-                val_mae += mae.item()
+                
+                # Calcular probabilidades y predicciones
+                probs = torch.sigmoid(logits)
+                preds = (probs > 0.5).float()
+                
+                all_probs.extend(probs.cpu().numpy().flatten())
+                all_labels.extend(labels.cpu().numpy().flatten())
+                all_preds.extend(preds.cpu().numpy().flatten())
         
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
-        val_mae /= len(val_loader)
+        
+        # Calcular métricas
+        val_auroc = roc_auc_score(all_labels, all_probs)
+        val_acc = accuracy_score(all_labels, all_preds)
+        val_f1 = f1_score(all_labels, all_preds)
         
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
-        history['val_mae'].append(val_mae)
+        history['val_auroc'].append(val_auroc)
+        history['val_acc'].append(val_acc)
+        history['val_f1'].append(val_f1)
         
-        print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, Val MAE={val_mae:.4f}")
+        print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, "
+              f"AUROC={val_auroc:.4f}, Acc={val_acc:.4f}, F1={val_f1:.4f}")
         
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_auroc > best_val_auroc:
+            best_val_auroc = val_auroc
             torch.save(model.state_dict(), 'best_gnn_det_lstm.pt')
     
     return history
 
 
 def train_gvae_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.001, kl_weight=0.001):
-    """Entrena el modelo GVAE+LSTM"""
+    """Entrena el modelo GVAE+LSTM con clasificación binaria"""
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
-    criterion = nn.MSELoss()
+    criterion = nn.BCEWithLogitsLoss()
     
     history = {'train_loss': [], 'train_task_loss': [], 'train_vae_loss': [],
-               'val_loss': [], 'val_mae': []}
-    best_val_loss = float('inf')
+               'val_loss': [], 'val_auroc': [], 'val_acc': [], 'val_f1': []}
+    best_val_auroc = 0.0
     
     for epoch in range(epochs):
         model.train()
@@ -633,17 +691,17 @@ def train_gvae_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.001
         train_task_loss = 0
         train_vae_loss = 0
         
-        for batched_by_layer, scores, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
-            scores = scores.to(device).unsqueeze(1)
+        for batched_by_layer, labels, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            labels = labels.to(device).unsqueeze(1)
             batched_by_layer = [data.to(device) for data in batched_by_layer]
             
             optimizer.zero_grad()
-            predictions, mu_list, logvar_list, orig_list, recon_list = model(
+            logits, mu_list, logvar_list, orig_list, recon_list = model(
                 batched_by_layer, len(batched_by_layer)
             )
             
-            # Pérdida de la tarea principal
-            task_loss = criterion(predictions, scores)
+            # Pérdida de la tarea principal (clasificación binaria)
+            task_loss = criterion(logits, labels)
             
             # Pérdida VAE acumulada sobre todas las capas
             vae_loss_total = 0
@@ -662,35 +720,50 @@ def train_gvae_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.001
         
         model.eval()
         val_loss = 0
-        val_mae = 0
+        all_probs = []
+        all_labels = []
+        all_preds = []
+        
         with torch.no_grad():
-            for batched_by_layer, scores, _ in val_loader:
-                scores = scores.to(device).unsqueeze(1)
+            for batched_by_layer, labels, _ in val_loader:
+                labels = labels.to(device).unsqueeze(1)
                 batched_by_layer = [data.to(device) for data in batched_by_layer]
                 
-                predictions, _, _, _, _ = model(batched_by_layer, len(batched_by_layer))
-                loss = criterion(predictions, scores)
-                mae = torch.abs(predictions - scores).mean()
-                
+                logits, _, _, _, _ = model(batched_by_layer, len(batched_by_layer))
+                loss = criterion(logits, labels)
                 val_loss += loss.item()
-                val_mae += mae.item()
+                
+                # Calcular probabilidades y predicciones
+                probs = torch.sigmoid(logits)
+                preds = (probs > 0.5).float()
+                
+                all_probs.extend(probs.cpu().numpy().flatten())
+                all_labels.extend(labels.cpu().numpy().flatten())
+                all_preds.extend(preds.cpu().numpy().flatten())
         
         train_loss /= len(train_loader)
         train_task_loss /= len(train_loader)
         train_vae_loss /= len(train_loader)
         val_loss /= len(val_loader)
-        val_mae /= len(val_loader)
+        
+        # Calcular métricas
+        val_auroc = roc_auc_score(all_labels, all_probs)
+        val_acc = accuracy_score(all_labels, all_preds)
+        val_f1 = f1_score(all_labels, all_preds)
         
         history['train_loss'].append(train_loss)
         history['train_task_loss'].append(train_task_loss)
         history['train_vae_loss'].append(train_vae_loss)
         history['val_loss'].append(val_loss)
-        history['val_mae'].append(val_mae)
+        history['val_auroc'].append(val_auroc)
+        history['val_acc'].append(val_acc)
+        history['val_f1'].append(val_f1)
         
-        print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f} (Task={train_task_loss:.4f}, VAE={train_vae_loss:.4f}), Val Loss={val_loss:.4f}, Val MAE={val_mae:.4f}")
+        print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f} (Task={train_task_loss:.4f}, VAE={train_vae_loss:.4f}), "
+              f"Val Loss={val_loss:.4f}, AUROC={val_auroc:.4f}, Acc={val_acc:.4f}, F1={val_f1:.4f}")
         
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_auroc > best_val_auroc:
+            best_val_auroc = val_auroc
             torch.save(model.state_dict(), 'best_gvae_lstm.pt')
     
     return history
@@ -705,7 +778,7 @@ def run_ablation_experiments(args):
     Ejecuta los 3 experimentos de ablación y compara resultados.
     """
     print("="*80)
-    print("EXPERIMENTOS DE ABLACIÓN - PRUEBA DE HIPÓTESIS")
+    print("EXPERIMENTOS DE ABLACIÓN - PRUEBA DE HIPÓTESIS (Metodología HaloScope)")
     print("="*80)
     print("\nHipótesis: La dinámica estructural secuencial a través de las capas")
     print("           es la señal clave para detectar alucinaciones.")
@@ -714,6 +787,8 @@ def run_ablation_experiments(args):
     print("  2. GNN-det+LSTM (Con estructura determinista)")
     print("  3. GVAE+LSTM (Con estructura + incertidumbre variacional)")
     print("\nEsperado: GVAE+LSTM > GNN-det+LSTM > LSTM-solo")
+    print("\nMétrica principal: AUROC (Area Under ROC Curve)")
+    print(f"Threshold de score: {args.score_threshold} (scores < threshold = alucinación)")
     print("="*80)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -724,7 +799,8 @@ def run_ablation_experiments(args):
     full_dataset = SequentialTraceDataset(
         args.data_pattern,
         args.scores_file,
-        attn_threshold=args.attn_threshold
+        attn_threshold=args.attn_threshold,
+        score_threshold=args.score_threshold
     )
     
     # Split train/val/test
@@ -783,8 +859,9 @@ def run_ablation_experiments(args):
         )
         
         results['LSTM-solo'] = {
-            'best_val_loss': min(history_lstm['val_loss']),
-            'best_val_mae': min(history_lstm['val_mae']),
+            'best_val_auroc': max(history_lstm['val_auroc']),
+            'best_val_acc': max(history_lstm['val_acc']),
+            'best_val_f1': max(history_lstm['val_f1']),
             'history': history_lstm
         }
     
@@ -812,8 +889,9 @@ def run_ablation_experiments(args):
         )
         
         results['GNN-det+LSTM'] = {
-            'best_val_loss': min(history_gnn['val_loss']),
-            'best_val_mae': min(history_gnn['val_mae']),
+            'best_val_auroc': max(history_gnn['val_auroc']),
+            'best_val_acc': max(history_gnn['val_acc']),
+            'best_val_f1': max(history_gnn['val_f1']),
             'history': history_gnn
         }
     
@@ -842,8 +920,9 @@ def run_ablation_experiments(args):
         )
         
         results['GVAE+LSTM'] = {
-            'best_val_loss': min(history_gvae['val_loss']),
-            'best_val_mae': min(history_gvae['val_mae']),
+            'best_val_auroc': max(history_gvae['val_auroc']),
+            'best_val_acc': max(history_gvae['val_acc']),
+            'best_val_f1': max(history_gvae['val_f1']),
             'history': history_gvae
         }
     
@@ -854,15 +933,16 @@ def run_ablation_experiments(args):
     print("RESULTADOS FINALES - TABLA DE ABLACIÓN")
     print("="*80)
     
-    print("\nMétrica: Validation Loss (MSE) - Menor es mejor")
-    print("-" * 60)
-    print(f"{'Modelo':<25} {'Best Val Loss':>15} {'Best Val MAE':>15}")
-    print("-" * 60)
+    print("\nMétrica Principal: AUROC (Mayor es mejor)")
+    print("-" * 80)
+    print(f"{'Modelo':<25} {'Best AUROC':>15} {'Best Accuracy':>15} {'Best F1':>15}")
+    print("-" * 80)
     
-    for model_name, metrics in sorted(results.items(), key=lambda x: x[1]['best_val_loss']):
-        print(f"{model_name:<25} {metrics['best_val_loss']:>15.4f} {metrics['best_val_mae']:>15.4f}")
+    for model_name, metrics in sorted(results.items(), key=lambda x: x[1]['best_val_auroc'], reverse=True):
+        print(f"{model_name:<25} {metrics['best_val_auroc']:>15.4f} "
+              f"{metrics['best_val_acc']:>15.4f} {metrics['best_val_f1']:>15.4f}")
     
-    print("-" * 60)
+    print("-" * 80)
     
     # Verificar hipótesis
     print("\n" + "="*80)
@@ -870,19 +950,19 @@ def run_ablation_experiments(args):
     print("="*80)
     
     if len(results) == 3:
-        lstm_loss = results['LSTM-solo']['best_val_loss']
-        gnn_loss = results['GNN-det+LSTM']['best_val_loss']
-        gvae_loss = results['GVAE+LSTM']['best_val_loss']
+        lstm_auroc = results['LSTM-solo']['best_val_auroc']
+        gnn_auroc = results['GNN-det+LSTM']['best_val_auroc']
+        gvae_auroc = results['GVAE+LSTM']['best_val_auroc']
         
-        print(f"\nLSTM-solo:     {lstm_loss:.4f}")
-        print(f"GNN-det+LSTM:  {gnn_loss:.4f} ({'✓' if gnn_loss < lstm_loss else '✗'} mejor que LSTM-solo)")
-        print(f"GVAE+LSTM:     {gvae_loss:.4f} ({'✓' if gvae_loss < gnn_loss else '✗'} mejor que GNN-det+LSTM)")
+        print(f"\nLSTM-solo:     AUROC = {lstm_auroc:.4f}")
+        print(f"GNN-det+LSTM:  AUROC = {gnn_auroc:.4f} ({'✓' if gnn_auroc > lstm_auroc else '✗'} mejor que LSTM-solo)")
+        print(f"GVAE+LSTM:     AUROC = {gvae_auroc:.4f} ({'✓' if gvae_auroc > gnn_auroc else '✗'} mejor que GNN-det+LSTM)")
         
-        if gvae_loss < gnn_loss < lstm_loss:
+        if gvae_auroc > gnn_auroc > lstm_auroc:
             print("\n🎉 HIPÓTESIS CONFIRMADA:")
             print("   GVAE+LSTM > GNN-det+LSTM > LSTM-solo")
             print("   La estructura del grafo Y la incertidumbre variacional aportan valor.")
-        elif gnn_loss < lstm_loss:
+        elif gnn_auroc > lstm_auroc:
             print("\n⚠️  HIPÓTESIS PARCIALMENTE CONFIRMADA:")
             print("   La estructura del grafo aporta valor, pero la incertidumbre")
             print("   variacional no mejora significativamente.")
@@ -901,10 +981,20 @@ def run_ablation_experiments(args):
     results_json = {}
     for model_name, metrics in results.items():
         results_json[model_name] = {
-            'best_val_loss': metrics['best_val_loss'],
-            'best_val_mae': metrics['best_val_mae'],
+            'best_val_auroc': metrics['best_val_auroc'],
+            'best_val_acc': metrics['best_val_acc'],
+            'best_val_f1': metrics['best_val_f1'],
             'history': {k: v for k, v in metrics['history'].items()}
         }
+    
+    # Agregar configuración
+    results_json['config'] = {
+        'score_threshold': args.score_threshold,
+        'attn_threshold': args.attn_threshold,
+        'epochs': args.epochs,
+        'batch_size': args.batch_size,
+        'lr': args.lr,
+    }
     
     with open(results_file, 'w') as f:
         json.dump(results_json, f, indent=2)
@@ -915,7 +1005,7 @@ def run_ablation_experiments(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description="Experimentos de ablación para detección de alucinaciones"
+        description="Experimentos de ablación para detección de alucinaciones (Metodología HaloScope)"
     )
     
     # Datos
@@ -925,6 +1015,8 @@ if __name__ == '__main__':
                        help='Archivo CSV con scores BLEURT')
     parser.add_argument('--attn-threshold', type=float, default=0.01,
                        help='Umbral de atención para crear arcos')
+    parser.add_argument('--score-threshold', type=float, default=0.5,
+                       help='Umbral de score BLEURT para etiquetar alucinaciones (score < threshold = alucinación)')
     
     # Entrenamiento
     parser.add_argument('--epochs', type=int, default=50,

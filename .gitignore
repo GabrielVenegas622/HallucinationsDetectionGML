@@ -4,3 +4,4 @@ data/
 ignore/
 traces_data/
 *.pkl
+.ipynb_checkpoints/
