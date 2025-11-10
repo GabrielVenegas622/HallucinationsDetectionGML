@@ -31,20 +31,17 @@ SEED_VALUE = 41
 
 def extract_activations_and_attentions(model, tokenizer, question, max_new_tokens=64):
     """
-    Extrae las activaciones (hidden states) y atenciones del estado final
-    de la generación (después de generar todos los tokens).
+    Extrae las activaciones (hidden states) y atenciones de TODA la secuencia
+    (prompt + respuesta generada).
     
-    Este método realiza una "foto final" del estado completo del modelo después
-    de generar toda la respuesta. Captura activaciones y atenciones para TODA
-    la secuencia (prompt + respuesta generada), lo cual es esencial para:
+    CORRECCIÓN: Esta versión realiza un forward pass separado después de generar
+    para obtener los hidden states de TODOS los tokens, no solo el último.
     
-    1. Analizar las atenciones que la respuesta presta al prompt (contexto)
-    2. Construir un grafo completo de dependencias entre todos los tokens
-    3. Detectar patrones de alucinación considerando la interacción prompt-respuesta
+    El problema anterior era que model.generate() con return_dict_in_generate=True
+    devuelve hidden_states POR PASO DE GENERACIÓN, donde cada paso solo contiene
+    el estado del NUEVO token generado, no de toda la secuencia acumulada.
     
-    IMPORTANTE: Solo se realiza UN forward pass al final, capturando el estado
-    completo de toda la secuencia. No se guardan estados intermedios de cada
-    paso de generación.
+    Solución: Generamos primero, luego hacemos un forward pass completo.
     
     Args:
         model: Modelo de lenguaje cargado
@@ -66,16 +63,18 @@ def extract_activations_and_attentions(model, tokenizer, question, max_new_token
                                (prompt + respuesta), útil para visualización en grafos
     """
     # Preparar el prompt (compatible con Llama)
-    prompt_text = f"Answer the question concisely in one sentence.\n\nQuestion: {question}\nAnswer:"
     prompt_text = f"Answer the question concisely. Q: {question} A:"
     
     prompt = tokenizer(prompt_text, return_tensors='pt').to(model.device)
+    prompt_length = prompt["input_ids"].shape[-1]
     
     # Asegurar que el tokenizer tiene tokens especiales configurados
     if tokenizer.eos_token_id is None:
         tokenizer.eos_token_id = tokenizer.convert_tokens_to_ids('<|endoftext|>')
     
-    # Generar con activaciones y atenciones
+    # ========================================================================
+    # PASO 1: GENERAR LA RESPUESTA
+    # ========================================================================
     with torch.no_grad():
         generation_output = model.generate(
             **prompt,
@@ -86,73 +85,67 @@ def extract_activations_and_attentions(model, tokenizer, question, max_new_token
             early_stopping=True,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
-            return_dict_in_generate=True,
+        )
+    
+    # Secuencia completa generada (prompt + respuesta)
+    full_sequence = generation_output[0]  # [seq_len_total]
+    seq_len_total = full_sequence.shape[0]
+    
+    # Decodificar la respuesta limpia (solo la parte generada)
+    generated_answer_clean = tokenizer.decode(
+        full_sequence[prompt_length:],
+        skip_special_tokens=True
+    )
+    
+    # ========================================================================
+    # PASO 2: FORWARD PASS COMPLETO PARA EXTRAER ACTIVACIONES Y ATENCIONES
+    # ========================================================================
+    # Este forward pass nos da los hidden states de TODOS los tokens
+    with torch.no_grad():
+        outputs = model(
+            input_ids=full_sequence.unsqueeze(0),  # [1, seq_len_total]
             output_attentions=True,
             output_hidden_states=True
         )
     
-    # Decodificar la respuesta completa (sin prompt, solo para guardar el texto)
-    prompt_length = prompt["input_ids"].shape[-1]
-    generated_answer_clean = tokenizer.decode(
-        generation_output.sequences[0, prompt_length:],
-        skip_special_tokens=True
-    )
-    
-    # Número de tokens realmente generados (sin prompt)
-    num_tokens_generated = generation_output.sequences.shape[-1] - prompt_length
-    
-    # Extraer hidden states y attentions del ESTADO FINAL (último paso de generación)
-    num_generated_steps = len(generation_output.hidden_states)
-    num_layers = len(generation_output.hidden_states[0]) - 1  # -1 porque incluye embeddings
-    
-    # Índice del último paso de generación
-    final_step_idx = num_generated_steps - 1
-    
-    # Longitud total de la secuencia (prompt + todos los tokens generados)
-    seq_len_total = prompt_length + num_tokens_generated
-    
-    # ========================================================================
-    # ESTADO FINAL: Foto completa de activaciones y atenciones
-    # ========================================================================
+    num_layers = len(outputs.hidden_states) - 1  # -1 porque incluye embeddings
     
     # Organizar hidden states: [capa] -> array[seq_len_total, hidden_dim]
-    # Extraemos SOLO el último paso que contiene el estado completo de toda la secuencia
     hidden_states_by_layer = []
     for layer_idx in range(1, num_layers + 1):  # Empezar desde 1 para saltar embeddings
-        # Estado final de esta capa (incluye prompt + todos los tokens generados)
-        final_state = generation_output.hidden_states[final_step_idx][layer_idx]
-        # Shape: [batch=1, seq_len, hidden_dim] -> [seq_len_total, hidden_dim]
-        final_state_full = final_state[0, :seq_len_total, :].cpu().numpy()
-        hidden_states_by_layer.append(final_state_full)
+        # Shape: [1, seq_len_total, hidden_dim] -> [seq_len_total, hidden_dim]
+        hidden_state = outputs.hidden_states[layer_idx][0].cpu().numpy()
+        hidden_states_by_layer.append(hidden_state)
     
     # Organizar attentions: [capa] -> array[num_heads, seq_len_total, seq_len_total]
-    # Extraemos SOLO el último paso que contiene la matriz de atención completa
     attentions_by_layer = []
     for layer_idx in range(num_layers):
-        # Atenciones finales de esta capa
-        final_attn = generation_output.attentions[final_step_idx][layer_idx]
-        # Shape: [batch=1, num_heads, seq_len, seq_len] -> [num_heads, seq_len_total, seq_len_total]
-        final_attn_full = final_attn[0, :, :seq_len_total, :seq_len_total].cpu().numpy()
-        attentions_by_layer.append(final_attn_full)
-      
-    # Tokens completos (IDs): prompt + respuesta generada
-    all_tokens = generation_output.sequences[0, :seq_len_total].cpu().numpy()
+        # Shape: [1, num_heads, seq_len_total, seq_len_total] -> [num_heads, seq_len_total, seq_len_total]
+        attention = outputs.attentions[layer_idx][0].cpu().numpy()
+        attentions_by_layer.append(attention)
     
     # Decodificar cada token individualmente para visualización en grafos
-    # Esto permite que cada nodo del grafo tenga una etiqueta legible
     tokens_decoded = []
-    for token_id in all_tokens:
+    for token_id in full_sequence:
         token_text = tokenizer.decode([token_id], skip_special_tokens=False)
         tokens_decoded.append(token_text)
     
     return {
         'hidden_states': hidden_states_by_layer,  # [num_layers] cada uno: [seq_len_total, hidden_dim]
         'attentions': attentions_by_layer,  # [num_layers] cada uno: [num_heads, seq_len_total, seq_len_total]
-        'tokens': all_tokens,  # IDs de TODOS los tokens (prompt + respuesta)
+        'tokens': full_sequence.cpu().numpy(),  # IDs de TODOS los tokens (prompt + respuesta)
         'tokens_decoded': tokens_decoded,  # Strings de TODOS los tokens decodificados
         'generated_answer_clean': generated_answer_clean  # Respuesta limpia (solo texto generado)
     }
-
+    
+    # ========================================================================
+    # Los siguientes bloques de código ya NO son necesarios porque ahora
+    # obtenemos todo directamente del forward pass completo en el PASO 2
+    # ========================================================================
+    
+    # NOTA: El código antiguo intentaba extraer de generation_output.hidden_states
+    # que solo contiene el estado del último token por paso, no la secuencia completa
+    
 HF_NAMES = {
     'qwen_2.5_6B' : '__',
     'llama2_chat_7B': 'meta-llama/Llama-2-7b-chat-hf',
