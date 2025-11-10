@@ -94,7 +94,7 @@ def compute_max_bleurt_score(reference_answers, generated_answer, tokenizer, mod
     max_score = max(all_scores)
     max_idx = all_scores.index(max_score)
     best_reference = reference_answers[max_idx]
-    print(max_score, best_reference, all_scores)
+    print(f"\n{max_score:.4f}, {generated_answer[:100]}, {best_reference[:100]}")
     return max_score, best_reference, all_scores
 
 
@@ -264,7 +264,6 @@ def generate_ground_truth_scores(args):
         reference_answers = ground_truth[question_id]
         
         # Calcular score BLEURT máximo comparando con TODAS las referencias
-        print(f"Respuesta: {generated_answer}, GT: {reference_answers}")
         max_score, best_reference, all_scores = compute_max_bleurt_score(
             reference_answers, 
             generated_answer, 
