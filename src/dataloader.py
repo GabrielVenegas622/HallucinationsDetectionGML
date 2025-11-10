@@ -1,5 +1,6 @@
 import glob
 import pickle
+import gzip
 import torch
 import gc  
 import numpy as np
@@ -30,15 +31,26 @@ class TraceGraphDataset(TorchDataset):
         self.attn_threshold = attn_threshold
         self.all_traces = []
         
-        print("buscando archivos pkl...")
+        print("Buscando archivos pkl/pkl.gz...")
+        # Buscar tanto .pkl como .pkl.gz
         file_paths = glob.glob(pkl_files_pattern)
-        print(f"encontrados {len(file_paths)} archivos pkl.")
+        # Si el patrón no incluye .gz, buscar también archivos comprimidos
+        if not pkl_files_pattern.endswith('.gz'):
+            file_paths.extend(glob.glob(pkl_files_pattern.replace('.pkl', '.pkl.gz')))
         
-        # Cargar los traces en memoria RAM, no se cuanta memoria se necesita por lo que esta solucion puede o no ser viable
+        print(f"Encontrados {len(file_paths)} archivos.")
+        
+        # Cargar los traces en memoria RAM
         for file_path in tqdm(file_paths, desc="Cargando traces"):
-            with open(file_path, 'rb') as f:
-                batch_data = pickle.load(f)
-                self.all_traces.extend(batch_data)
+            # Detectar si el archivo está comprimido
+            if file_path.endswith('.gz'):
+                with gzip.open(file_path, 'rb') as f:
+                    batch_data = pickle.load(f)
+            else:
+                with open(file_path, 'rb') as f:
+                    batch_data = pickle.load(f)
+            
+            self.all_traces.extend(batch_data)
                 
         print("Carga de traces en memoria RAM completada.")
         

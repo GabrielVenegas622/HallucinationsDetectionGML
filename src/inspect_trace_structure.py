@@ -6,10 +6,11 @@ Analiza la estructura de los traces para entender el mismatch entre
 hidden_states y attentions.
 
 Uso:
-    python inspect_trace_structure.py --data-pattern "traces_data/*.pkl" --num-samples 5
+    python inspect_trace_structure.py --data-pattern "traces_data/*.pkl*" --num-samples 5
 """
 
 import pickle
+import gzip
 import glob
 import numpy as np
 import argparse
@@ -27,7 +28,7 @@ def inspect_trace_structure(file_pattern, num_samples=5):
         print(f"❌ No se encontraron archivos con patrón: {file_pattern}")
         return
     
-    print(f"\nEncontrados {len(files)} archivos .pkl")
+    print(f"\nEncontrados {len(files)} archivos")
     print(f"Inspeccionando {num_samples} traces de ejemplo...\n")
     
     all_samples = []
@@ -35,8 +36,13 @@ def inspect_trace_structure(file_pattern, num_samples=5):
     # Recolectar muestras
     for file_path in files[:min(3, len(files))]:
         try:
-            with open(file_path, 'rb') as f:
-                traces = pickle.load(f)
+            # Detectar si el archivo está comprimido
+            if file_path.endswith('.gz'):
+                with gzip.open(file_path, 'rb') as f:
+                    traces = pickle.load(f)
+            else:
+                with open(file_path, 'rb') as f:
+                    traces = pickle.load(f)
             
             for i, trace in enumerate(traces[:min(2, len(traces))]):
                 all_samples.append((file_path, i, trace))

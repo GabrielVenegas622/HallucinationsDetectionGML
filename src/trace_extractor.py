@@ -3,6 +3,7 @@ import random
 import os
 import numpy as np
 import pickle
+import gzip
 import argparse
 from pathlib import Path
 from tqdm import tqdm
@@ -111,17 +112,23 @@ def extract_activations_and_attentions(model, tokenizer, question, max_new_token
     num_layers = len(outputs.hidden_states) - 1  # -1 porque incluye embeddings
     
     # Organizar hidden states: [capa] -> array[seq_len_total, hidden_dim]
+    # OPTIMIZACIÓN: Convertir a float16 para reducir tamaño (pérdida mínima de precisión)
     hidden_states_by_layer = []
     for layer_idx in range(1, num_layers + 1):  # Empezar desde 1 para saltar embeddings
         # Shape: [1, seq_len_total, hidden_dim] -> [seq_len_total, hidden_dim]
         hidden_state = outputs.hidden_states[layer_idx][0].cpu().numpy()
+        # Convertir a float16 para ahorrar espacio
+        hidden_state = hidden_state.astype(np.float16)
         hidden_states_by_layer.append(hidden_state)
     
     # Organizar attentions: [capa] -> array[num_heads, seq_len_total, seq_len_total]
+    # OPTIMIZACIÓN: Convertir a float16
     attentions_by_layer = []
     for layer_idx in range(num_layers):
         # Shape: [1, num_heads, seq_len_total, seq_len_total] -> [num_heads, seq_len_total, seq_len_total]
         attention = outputs.attentions[layer_idx][0].cpu().numpy()
+        # Convertir a float16 para ahorrar espacio
+        attention = attention.astype(np.float16)
         attentions_by_layer.append(attention)
     
     # Decodificar cada token individualmente para visualización en grafos
@@ -271,16 +278,17 @@ def main(args):
         
         # Guardar batch cuando alcance el tamaño especificado
         if len(current_batch) >= BATCH_SIZE:
-            # Formato: <modelo>_<dataset>_<num_batch>
-            output_file = output_dir / f"{model_name}_{dataset_name}_batch_{batch_number:04d}.pkl"
+            # Formato: <modelo>_<dataset>_<num_batch>.pkl.gz (comprimido)
+            output_file = output_dir / f"{model_name}_{dataset_name}_batch_{batch_number:04d}.pkl.gz"
             print(f"\n💾 Guardando batch {batch_number} en {output_file.name}...")
             
-            with open(output_file, 'wb') as f:
+            # Guardar con compresión gzip (nivel 6 = buen balance velocidad/compresión)
+            with gzip.open(output_file, 'wb', compresslevel=6) as f:
                 pickle.dump(current_batch, f)
             
             # Calcular tamaño del archivo
             file_size_mb = output_file.stat().st_size / (1024 * 1024)
-            print(f"   ✅ Batch {batch_number} guardado: {len(current_batch)} traces, {file_size_mb:.2f} MB")
+            print(f"   ✅ Batch {batch_number} guardado: {len(current_batch)} traces, {file_size_mb:.2f} MB (comprimido)")
             
             # Resetear batch y liberar memoria
             current_batch = []
@@ -292,14 +300,15 @@ def main(args):
     
     # Guardar el último batch si tiene datos
     if current_batch:
-        output_file = output_dir / f"{model_name}_{dataset_name}_batch_{batch_number:04d}.pkl"
+        output_file = output_dir / f"{model_name}_{dataset_name}_batch_{batch_number:04d}.pkl.gz"
         print(f"\n💾 Guardando último batch {batch_number} en {output_file.name}...")
         
-        with open(output_file, 'wb') as f:
+        # Guardar con compresión gzip
+        with gzip.open(output_file, 'wb', compresslevel=6) as f:
             pickle.dump(current_batch, f)
         
         file_size_mb = output_file.stat().st_size / (1024 * 1024)
-        print(f"   ✅ Batch {batch_number} guardado: {len(current_batch)} traces, {file_size_mb:.2f} MB")
+        print(f"   ✅ Batch {batch_number} guardado: {len(current_batch)} traces, {file_size_mb:.2f} MB (comprimido)")
         batch_number += 1
     
     # Resumen final

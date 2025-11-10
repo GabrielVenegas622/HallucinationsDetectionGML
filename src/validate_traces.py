@@ -2,14 +2,15 @@
 """
 Script de Validación de Traces
 
-Verifica que los datos en .pkl no tengan inconsistencias entre
+Verifica que los datos en .pkl/.pkl.gz no tengan inconsistencias entre
 hidden_states y attentions que causen errores de índices.
 
 Uso:
-    python validate_traces.py --data-pattern "traces_data/*.pkl"
+    python validate_traces.py --data-pattern "traces_data/*.pkl*"
 """
 
 import pickle
+import gzip
 import glob
 import numpy as np
 import argparse
@@ -114,8 +115,13 @@ def validate_all_traces(file_pattern):
     
     for file_path in tqdm(files, desc="Validando archivos"):
         try:
-            with open(file_path, 'rb') as f:
-                traces = pickle.load(f)
+            # Detectar si el archivo está comprimido
+            if file_path.endswith('.gz'):
+                with gzip.open(file_path, 'rb') as f:
+                    traces = pickle.load(f)
+            else:
+                with open(file_path, 'rb') as f:
+                    traces = pickle.load(f)
             
             for trace_idx, trace in enumerate(traces):
                 total_traces += 1
