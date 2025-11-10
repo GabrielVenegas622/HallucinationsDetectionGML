@@ -137,6 +137,10 @@ class TraceGraphDataset(TorchDataset):
             dtype=torch.float
         )
         
+        # Obtener número de nodos (tokens en la secuencia)
+        # Esto DEBERÍA incluir prompt + respuesta si se extrajo correctamente
+        num_nodes = node_features.shape[0]
+        
         # 2. Arcos (Edges) y Atributos de Arco (Edge Attributes)
         # Extrae las atenciones de la capa específica
         attentions_layer = torch.tensor(
@@ -147,6 +151,42 @@ class TraceGraphDataset(TorchDataset):
         # Promediamos las cabezas de atención [cite: 191]
         attn_avg = attentions_layer.mean(axis=0)
         
+        # VALIDACIÓN CRÍTICA: Verificar consistencia entre hidden_states y attentions
+        # IMPORTANTE: Si hidden_states es del prompt+respuesta completo, attn_avg DEBE ser cuadrada del mismo tamaño
+        # Si hay mismatch, puede indicar:
+        #   1. Las atenciones fueron extraídas con padding fijo (ej: 512x512)
+        #   2. Solo se guardaron hidden_states de la respuesta, no del prompt
+        #   3. Hay un bug en la extracción de traces
+        
+        if attn_avg.shape[0] != num_nodes or attn_avg.shape[1] != num_nodes:
+            # WARNING: Dimensiones no coinciden
+            # El dataloader corregirá esto recortando o rellenando
+            
+            # Caso 1: attn_avg es MÁS GRANDE que num_nodes (padding o secuencia completa vs parcial)
+            if attn_avg.shape[0] > num_nodes or attn_avg.shape[1] > num_nodes:
+                # Recortar a los nodos reales
+                attn_avg = attn_avg[:num_nodes, :num_nodes]
+                
+                # WARNING si la diferencia es muy grande (indica posible problema en extracción)
+                if attn_avg.shape[0] > num_nodes * 2:
+                    print(f"⚠️  WARNING: Trace {trace.get('question_id', '?')}, capa {layer_idx}: "
+                          f"Atenciones ({attentions_layer.shape[1]}x{attentions_layer.shape[2]}) >> "
+                          f"hidden_states ({num_nodes} nodos). Recortando automáticamente.")
+                    if num_nodes == 1:
+                        print(f"   ⚠️  CRÍTICO: Solo 1 nodo pero atenciones grandes. "
+                              f"¿Se guardó solo la respuesta y no el prompt?")
+            
+            # Caso 2: attn_avg es MÁS PEQUEÑO que num_nodes (caso raro)
+            elif attn_avg.shape[0] < num_nodes or attn_avg.shape[1] < num_nodes:
+                # Rellenar si es más pequeño (caso muy raro)
+                pad_size = num_nodes
+                padded = torch.zeros((pad_size, pad_size), dtype=attn_avg.dtype)
+                padded[:attn_avg.shape[0], :attn_avg.shape[1]] = attn_avg
+                attn_avg = padded
+                print(f"⚠️  WARNING: Trace {trace.get('question_id', '?')}, capa {layer_idx}: "
+                      f"Atenciones ({attentions_layer.shape[1]}x{attentions_layer.shape[2]}) < "
+                      f"hidden_states ({num_nodes} nodos). Rellenando con zeros.")
+        
         # Aplicamos el umbral [cite: 194]
         mask = attn_avg > self.attn_threshold
         
@@ -154,12 +194,44 @@ class TraceGraphDataset(TorchDataset):
         # (Fuente -> Destino)
         indices = mask.nonzero(as_tuple=False).t() # [2, num_edges]
         
-        # Según[cite: 195], el flujo es (j -> i), por lo que j=fuente, i=destino
-        # indices[0] es 'i' (fila, destino)
-        # indices[1] es 'j' (columna, fuente)
-        edge_index = torch.stack([indices[1], indices[0]], dim=0)
-        
-        edge_attr = attn_avg[mask]
+        # Verificar que los índices estén en rango válido
+        # (No deberían estar fuera de rango después del recorte, pero validamos por seguridad)
+        if indices.numel() > 0:
+            # Filtrar índices fuera de rango 
+            valid_mask = (indices[0] < num_nodes) & (indices[1] < num_nodes)
+            
+            if not valid_mask.all():
+                num_invalid = (~valid_mask).sum().item()
+                print(f"⚠️  WARNING: {num_invalid} arcos con índices fuera de rango [0, {num_nodes}) "
+                      f"en trace {trace.get('question_id', '?')}, capa {layer_idx}. Filtrando.")
+            
+            indices = indices[:, valid_mask]
+            
+            # Según[cite: 195], el flujo es (j -> i), por lo que j=fuente, i=destino
+            # indices[0] es 'i' (fila, destino)
+            # indices[1] es 'j' (columna, fuente)
+            if indices.numel() > 0:
+                edge_index = torch.stack([indices[1], indices[0]], dim=0)
+                
+                # Obtener edge_attr correspondiente
+                # Necesitamos reconstruir la máscara válida original
+                edge_attr_values = attn_avg[mask]
+                if valid_mask.numel() > 0:
+                    edge_attr = edge_attr_values[valid_mask]
+                else:
+                    edge_attr = edge_attr_values
+                
+                # Asegurar que edge_attr sea 2D
+                if edge_attr.dim() == 1:
+                    edge_attr = edge_attr.unsqueeze(1)
+            else:
+                # Todos los índices fueron inválidos
+                edge_index = torch.empty((2, 0), dtype=torch.long)
+                edge_attr = torch.empty((0, 1), dtype=torch.float)
+        else:
+            # No hay arcos que superen el threshold
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+            edge_attr = torch.empty((0, 1), dtype=torch.float)
 
         # 3. Crear el objeto Data de PyG
         data = Data(
@@ -169,10 +241,10 @@ class TraceGraphDataset(TorchDataset):
         )
         
         # 4. Añadir metadatos adicionales al grafo
-        data.question_id = trace['question_id'] # [cite: 65]
-        data.answer = trace['generated_answer_clean'] # [cite: 66]
-        data.tokens_decoded = trace['tokens_decoded'] # [cite: 72]
-        data.num_nodes = node_features.shape[0]
+        data.question_id = trace.get('question_id', 'unknown') # [cite: 65]
+        data.answer = trace.get('generated_answer_clean', '') # [cite: 66]
+        data.tokens_decoded = trace.get('tokens_decoded', []) # [cite: 72]
+        data.num_nodes = num_nodes
         
         # --- NUEVO METADATO ---
         data.layer_idx = layer_idx # Guardamos de qué capa vino

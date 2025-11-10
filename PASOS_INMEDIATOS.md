@@ -1,29 +1,87 @@
-# 🎯 PASOS A SEGUIR AHORA
+# 🎯 PASOS A SEGUIR AHORA (ACTUALIZADO)
 
-## Situación Actual
+## Situación Actual - PROBLEMA IDENTIFICADO ✓
 
-Has encontrado el error `CUBLAS_STATUS_EXECUTION_FAILED` al ejecutar GNN-det+LSTM.
-El LSTM funciona bien, el problema es específico de las capas GNN.
+Has encontrado el error **"index out of range in self"** causado por un **mismatch entre hidden_states y attentions**.
 
-## ✅ Solución Inmediata (5 minutos)
-
-### PASO 1: Ejecutar Diagnóstico
-
-```bash
-python src/diagnose_cuda_error.py \
-    --data-pattern "traces_data/*.pkl" \
-    --scores-file ground_truth_scores.csv
+**Diagnóstico:**
+```
+x.shape: torch.Size([1, 4096])        # Solo 1 token
+edge_index.shape: torch.Size([2, 30])  # Pero hay 30 arcos
 ```
 
-**Qué esperar:**
-- El script verificará tu ambiente CUDA
-- Revisará si hay NaN/Inf en los datos
-- Probará el modelo en CPU y GPU
-- Te dará recomendaciones específicas
+**Causa:** Las atenciones tienen dimensiones mayores que el número real de tokens.
 
-### PASO 2: Seguir la Recomendación del Diagnóstico
+## ✅ SOLUCIÓN APLICADA
 
-El script te dirá cuál es el problema. Las opciones más comunes son:
+Ya se corrigió el `dataloader.py` para:
+- ✓ Recortar attentions al tamaño de hidden_states
+- ✓ Validar índices antes de crear edge_index
+- ✓ Filtrar índices fuera de rango
+
+## 🚀 Acción Inmediata (2 minutos)
+
+### PASO 1: Validar Tus Datos
+
+```bash
+python src/validate_traces.py --data-pattern "traces_data/*.pkl"
+```
+
+**Esto te dirá:**
+- Si hay mismatches críticos en tus datos
+- Cuántos traces tienen el problema
+- Qué hacer al respecto
+
+### PASO 2A: Si la Validación Dice "TODOS VÁLIDOS"
+
+```bash
+# Ejecutar quick test
+python src/quick_test.py \
+    --data-pattern "traces_data/*.pkl" \
+    --scores-file ground_truth_scores.csv
+
+# Si pasa, entrenar:
+python src/baseline.py \
+    --data-pattern "traces_data/*.pkl" \
+    --scores-file ground_truth_scores.csv \
+    --batch-size 16 \
+    --epochs 50
+```
+
+### PASO 2B: Si Hay Problemas Críticos
+
+El dataloader YA los maneja automáticamente, pero si quieres limpiar los datos permanentemente:
+
+```python
+# Crear archivo clean_traces.py
+import pickle
+import glob
+import numpy as np
+
+def fix_traces(pattern):
+    files = glob.glob(pattern)
+    for file_path in files:
+        with open(file_path, 'rb') as f:
+            traces = pickle.load(f)
+        
+        for trace in traces:
+            for layer_idx in range(len(trace['hidden_states'])):
+                hs = trace['hidden_states'][layer_idx]
+                attn = trace['attentions'][layer_idx]
+                
+                seq_len = hs.shape[0]
+                if attn.shape[1] > seq_len or attn.shape[2] > seq_len:
+                    trace['attentions'][layer_idx] = attn[:, :seq_len, :seq_len]
+        
+        output = file_path.replace('.pkl', '_fixed.pkl')
+        with open(output, 'wb') as f:
+            pickle.dump(traces, f)
+        print(f"Fixed: {output}")
+
+fix_traces("traces_data/*.pkl")
+```
+
+Luego entrenar con `*_fixed.pkl`.
 
 #### Opción A: Funciona en CPU pero no en GPU
 **Solución: Usar CPU**
