@@ -17,13 +17,13 @@ This repository contains the source code for the _Graph Machine Learning (IIC367
 HallucinationsDetectionGML/
 ├── src/
 │   ├── trace_extractor.py       # Extracts LLM traces (hidden states + attentions)
-│   ├── trace_to_gt.py           # Generates ground truth scores using Bleurt-20
+│   ├── trace_to_gt.py           # Generates ground truth scores using BLEURT-20
 │   ├── dataloader.py            # Converts traces to graph sequences for training
-│   └── baseline.py              # Trains GNN-det+LSTM for hallucination detection
+│   └── baseline.py              # Trains 3 models: LSTM, GNN-det+LSTM, GVAE+LSTM
 ├── traces_data/                 # Generated trace files (.pkl.gz)
 ├── notebooks/                   # EDA and prototyping notebooks
 ├── docs/                        # Additional documentation
-├── ignore/                      # Development notes and old docs
+├── misc/                        # Miscellaneous files
 └── README.md
 ```
 
@@ -54,8 +54,8 @@ python src/trace_to_gt.py \
 
 **Salida:** `ground_truth_scores.csv` con scores [0,1] por respuesta
 
-## 3️⃣ Entrenamiento del Modelo
-Entrena GNN-det+LSTM para detección de alucinaciones.
+## 3️⃣ Entrenamiento de Modelos (Experimentos de Ablación)
+Entrena 3 modelos para comparar arquitecturas (metodología HaloScope):
 
 ```bash
 python src/baseline.py \
@@ -66,7 +66,12 @@ python src/baseline.py \
     --score-threshold 0.5
 ```
 
-**Salida:** Modelo entrenado con métricas AUROC
+**Modelos entrenados:**
+1. **LSTM-solo**: Baseline sin estructura de grafo
+2. **GNN-det+LSTM**: Con estructura de grafo determinista
+3. **GVAE+LSTM**: Con estructura + incertidumbre variacional
+
+**Salida:** Resultados de ablación con métricas AUROC, accuracy, F1
 
 ---
 
@@ -170,7 +175,7 @@ loader = DataLoader(dataset, batch_size=16, shuffle=True)
 ---
 
 ## `src/baseline.py`
-Entrena modelo GNN-det+LSTM basado en metodología HaloScope.
+Experimentos de ablación: entrena y compara 3 arquitecturas (metodología HaloScope).
 
 **Uso:**
 ```bash
@@ -180,7 +185,7 @@ python src/baseline.py \
     --batch-size 16 \
     --epochs 50 \
     --score-threshold 0.5 \
-    --learning-rate 0.001
+    --lr 0.001
 ```
 
 **Parámetros principales:**
@@ -189,13 +194,27 @@ python src/baseline.py \
 - `--score-threshold`: Umbral para clasificar alucinación (default: 0.5)
 - `--batch-size`: Tamaño de batch (default: 16)
 - `--epochs`: Épocas de entrenamiento (default: 50)
+- `--run-lstm/--run-gnn-det/--run-gvae`: Controlar qué modelos ejecutar (default: todos)
 
-**Arquitectura:**
-- **GNN-det:** 3 capas GINE para procesar grafos por capa
-- **LSTM:** Procesa secuencia de embeddings de capas
-- **Loss:** Binary Cross Entropy
-- **Métrica:** AUROC
+**Modelos (3 arquitecturas):**
 
-**Salida:** Modelo entrenado + métricas de evaluación
+1. **LSTM-solo**: Baseline sin estructura de grafo
+   - Solo secuencia temporal de capas
+
+2. **GNN-det+LSTM**: Con estructura de grafo determinista
+   - 2 capas GINE (con edge features = atención) por capa de LLM
+   - LSTM bidireccional para dinámica temporal
+
+3. **GVAE+LSTM**: Con estructura + incertidumbre variacional
+   - Encoder GVAE con edge features
+   - Modelado de incertidumbre con distribución latente
+   - LSTM sobre representaciones latentes
+
+**Metodología (HaloScope):**
+- Ground truth: Scores BLEURT → etiquetas binarias con threshold
+- Loss: Binary Cross Entropy (+ KL divergence para GVAE)
+- Métrica principal: **AUROC**
+
+**Salida:** Resultados de ablación en `ablation_results/` + métricas comparativas
 
 ---
