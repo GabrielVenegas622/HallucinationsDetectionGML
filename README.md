@@ -17,7 +17,7 @@ This repository contains the source code for the _Graph Machine Learning (IIC367
 HallucinationsDetectionGML/
 ├── src/
 │   ├── trace_extractor.py       # Extracts LLM traces (hidden states + attentions)
-│   ├── trace_to_gt.py           # Generates ground truth scores using SelfCheckGPT
+│   ├── trace_to_gt.py           # Generates ground truth scores using Bleurt-20
 │   ├── dataloader.py            # Converts traces to graph sequences for training
 │   └── baseline.py              # Trains GNN-det+LSTM for hallucination detection
 ├── traces_data/                 # Generated trace files (.pkl.gz)
@@ -43,7 +43,7 @@ python src/trace_extractor.py \
 **Salida:** `traces_data/*.pkl.gz` (archivos comprimidos con traces)
 
 ## 2️⃣ Generación de Ground Truth
-Calcula scores de hallucination usando SelfCheckGPT.
+Calcula scores de hallucination usando BLEURT-20 ([bleurt-pytorch](https://github.com/lucadiliello/bleurt-pytorch)).
 
 ```bash
 python src/trace_to_gt.py \
@@ -72,19 +72,18 @@ python src/baseline.py \
 
 # ✅ ToDo
 
-### Avance
-- [x] Implementar **Llama2-7B-Chat** y generar respuestas sobre **TriviaQA**
-- [x] Crear `trace_extractor.py` para extraer hidden states y attentions
-- [x] Procesar traces y guardar con compresión gzip + float16
-- [x] Implementar `dataloader.py` para convertir traces a grafos
-- [x] Implementar `trace_to_gt.py` para generar ground truth con SelfCheckGPT
-- [x] Implementar `baseline.py` con GNN-det+LSTM (metodología HaloScope)
-
 ### Entrega Final
 - [ ] Entrenar modelo completo sobre dataset completo
 - [ ] Implementar comparación con HaloScope original
 - [ ] Ejecutar evaluación y generar gráficos comparativos
 - [ ] Documentar resultados finales
+
+### Avance
+- [x] Implementar **Llama2-7B-Chat** y generar respuestas sobre **TriviaQA**
+- [x] Crear `trace_extractor.py` para extraer hidden states y attentions
+- [x] Implementar `dataloader.py` para convertir traces a grafos
+- [x] Implementar `trace_to_gt.py` para generar ground truth con Bleurt-20
+- [x] Implementar `baseline.py` con GNN-det+LSTM (metodología HaloScope)
 
 ### Propuesta 
 - [x] Graphical abstract
@@ -122,7 +121,7 @@ python src/trace_extractor.py \
 ---
 
 ## `src/trace_to_gt.py`
-Genera ground truth scores usando SelfCheckGPT.
+Genera ground truth scores usando BLEURT-20 ([bleurt-pytorch](https://github.com/lucadiliello/bleurt-pytorch)).
 
 **Uso:**
 ```bash
@@ -137,6 +136,8 @@ python src/trace_to_gt.py \
 - `--output-file`: Archivo CSV de salida
 - `--num-samples`: Número de samples por pregunta (default: 10)
 - `--batch-size`: Batch size para procesamiento (default: 4)
+
+**Método:** Genera múltiples respuestas por pregunta y calcula consistencia semántica usando BLEURT-20.
 
 **Salida:** CSV con columnas `[question_id, hallucination_score]`
 
