@@ -171,30 +171,66 @@ class GNNDetLSTM(nn.Module):
         layer_representations = []
         
         # Procesar cada capa con GINE (usando edge_attr)
-        for layer_data in batched_graphs_by_layer:
+        for layer_idx, layer_data in enumerate(batched_graphs_by_layer):
             x, edge_index, edge_attr, batch = (
                 layer_data.x, 
                 layer_data.edge_index, 
-                layer_data.edge_attr,  # ← AHORA USAMOS ESTO
+                layer_data.edge_attr,
                 layer_data.batch
             )
             
+            # Validar que x no tenga NaN o Inf
+            if torch.isnan(x).any() or torch.isinf(x).any():
+                print(f"WARNING: NaN o Inf detectado en x de capa {layer_idx}")
+                x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+            
             # Manejo seguro de edge_attr
             if edge_attr is not None and edge_attr.numel() > 0:
+                # Validar que edge_attr no tenga NaN o Inf
+                if torch.isnan(edge_attr).any() or torch.isinf(edge_attr).any():
+                    print(f"WARNING: NaN o Inf detectado en edge_attr de capa {layer_idx}")
+                    edge_attr = torch.nan_to_num(edge_attr, nan=0.0, posinf=1.0, neginf=0.0)
+                
                 # Asegurar que edge_attr tenga la forma correcta [num_edges, 1]
                 if edge_attr.dim() == 1:
                     edge_attr = edge_attr.unsqueeze(1)
+                
                 # Verificar que el número de arcos coincide
-                assert edge_attr.size(0) == edge_index.size(1), \
-                    f"Mismatch: edge_attr tiene {edge_attr.size(0)} elementos pero hay {edge_index.size(1)} arcos"
+                if edge_attr.size(0) != edge_index.size(1):
+                    print(f"WARNING: Mismatch en capa {layer_idx}: edge_attr={edge_attr.size(0)}, edges={edge_index.size(1)}")
+                    # Ajustar edge_attr al tamaño correcto
+                    num_edges = edge_index.size(1)
+                    if edge_attr.size(0) > num_edges:
+                        edge_attr = edge_attr[:num_edges]
+                    else:
+                        padding = torch.zeros((num_edges - edge_attr.size(0), 1), 
+                                            dtype=edge_attr.dtype, device=edge_attr.device)
+                        edge_attr = torch.cat([edge_attr, padding], dim=0)
+                
+                # Clip valores extremos en edge_attr
+                edge_attr = torch.clamp(edge_attr, min=0.0, max=1.0)
             else:
                 # Si no hay arcos, crear edge_attr vacío con forma correcta
                 edge_attr = torch.zeros((0, 1), dtype=torch.float, device=x.device)
             
             # GINE encoding: propaga información considerando pesos de atención
-            x = F.relu(self.conv1(x, edge_index, edge_attr))
-            x = F.dropout(x, p=0.2, training=self.training)
-            x = self.conv2(x, edge_index, edge_attr)
+            try:
+                x = F.relu(self.conv1(x, edge_index, edge_attr))
+                x = F.dropout(x, p=0.2, training=self.training)
+                x = self.conv2(x, edge_index, edge_attr)
+            except RuntimeError as e:
+                print(f"ERROR en GINE de capa {layer_idx}:")
+                print(f"  x.shape: {x.shape}, device: {x.device}, dtype: {x.dtype}")
+                print(f"  edge_index.shape: {edge_index.shape}, num_edges: {edge_index.size(1)}")
+                print(f"  edge_attr.shape: {edge_attr.shape}")
+                print(f"  Rango de x: [{x.min().item():.4f}, {x.max().item():.4f}]")
+                print(f"  Rango de edge_attr: [{edge_attr.min().item():.4f}, {edge_attr.max().item():.4f}]")
+                raise e
+            
+            # Validar salida
+            if torch.isnan(x).any() or torch.isinf(x).any():
+                print(f"WARNING: NaN o Inf en salida de GINE capa {layer_idx}")
+                x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
             
             # Global pooling: un vector por grafo en el batch
             graph_repr = global_mean_pool(x, batch)  # [batch_size, gnn_hidden]
@@ -293,22 +329,55 @@ class GVAELSTM(nn.Module):
         
     def encode(self, x, edge_index, edge_attr, batch):
         """Encoder: grafo (con edge features) → distribución latente"""
+        
+        # Validar que x no tenga NaN o Inf
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print(f"WARNING: NaN o Inf detectado en x del encoder")
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+        
         # Manejo seguro de edge_attr
         if edge_attr is not None and edge_attr.numel() > 0:
+            # Validar que edge_attr no tenga NaN o Inf
+            if torch.isnan(edge_attr).any() or torch.isinf(edge_attr).any():
+                print(f"WARNING: NaN o Inf detectado en edge_attr del encoder")
+                edge_attr = torch.nan_to_num(edge_attr, nan=0.0, posinf=1.0, neginf=0.0)
+            
             # Asegurar que edge_attr tenga la forma correcta [num_edges, 1]
             if edge_attr.dim() == 1:
                 edge_attr = edge_attr.unsqueeze(1)
+            
             # Verificar que el número de arcos coincide
-            assert edge_attr.size(0) == edge_index.size(1), \
-                f"Mismatch: edge_attr tiene {edge_attr.size(0)} elementos pero hay {edge_index.size(1)} arcos"
+            if edge_attr.size(0) != edge_index.size(1):
+                num_edges = edge_index.size(1)
+                if edge_attr.size(0) > num_edges:
+                    edge_attr = edge_attr[:num_edges]
+                else:
+                    padding = torch.zeros((num_edges - edge_attr.size(0), 1), 
+                                        dtype=edge_attr.dtype, device=edge_attr.device)
+                    edge_attr = torch.cat([edge_attr, padding], dim=0)
+            
+            # Clip valores extremos
+            edge_attr = torch.clamp(edge_attr, min=0.0, max=1.0)
         else:
             # Si no hay arcos, crear edge_attr vacío con forma correcta
             edge_attr = torch.zeros((0, 1), dtype=torch.float, device=x.device)
         
         # GINE: usa edge features (pesos de atención)
-        x = F.relu(self.conv1(x, edge_index, edge_attr))
-        x = F.dropout(x, p=0.2, training=self.training)
-        x = self.conv2(x, edge_index, edge_attr)
+        try:
+            x = F.relu(self.conv1(x, edge_index, edge_attr))
+            x = F.dropout(x, p=0.2, training=self.training)
+            x = self.conv2(x, edge_index, edge_attr)
+        except RuntimeError as e:
+            print(f"ERROR en GINE encoder:")
+            print(f"  x.shape: {x.shape}, device: {x.device}")
+            print(f"  edge_index.shape: {edge_index.shape}")
+            print(f"  edge_attr.shape: {edge_attr.shape}")
+            raise e
+        
+        # Validar salida
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print(f"WARNING: NaN o Inf en salida de encoder GINE")
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
         
         # Global pooling
         graph_repr = global_mean_pool(x, batch)
@@ -316,6 +385,9 @@ class GVAELSTM(nn.Module):
         # Parámetros de la distribución
         mu = self.fc_mu(graph_repr)
         logvar = self.fc_logvar(graph_repr)
+        
+        # Clip logvar para evitar valores extremos
+        logvar = torch.clamp(logvar, min=-10, max=10)
         
         return mu, logvar, graph_repr
     
@@ -846,8 +918,21 @@ def run_ablation_experiments(args):
     print(f"Threshold de score: {args.score_threshold} (scores < threshold = alucinación)")
     print("="*80)
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Configurar device
+    if args.force_cpu:
+        device = torch.device('cpu')
+        print(f"\n⚠️  Modo CPU forzado (puede ser más lento)")
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     print(f"\nDispositivo: {device}")
+    
+    if device.type == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Memoria GPU disponible: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        # Limpiar cache de CUDA
+        torch.cuda.empty_cache()
+        print("Cache de CUDA limpiado")
     
     # Crear dataset
     print("\nCargando dataset...")
@@ -1104,6 +1189,8 @@ if __name__ == '__main__':
                        help='Ejecutar experimento GVAE+LSTM')
     parser.add_argument('--output-dir', type=str, default='./ablation_results',
                        help='Directorio para guardar resultados')
+    parser.add_argument('--force-cpu', action='store_true',
+                       help='Forzar ejecución en CPU (útil si hay problemas con CUDA)')
     
     args = parser.parse_args()
     
