@@ -179,9 +179,17 @@ class GNNDetLSTM(nn.Module):
                 layer_data.batch
             )
             
-            # Asegurar que edge_attr tenga la forma correcta [num_edges, 1]
-            if edge_attr.dim() == 1:
-                edge_attr = edge_attr.unsqueeze(1)
+            # Manejo seguro de edge_attr
+            if edge_attr is not None and edge_attr.numel() > 0:
+                # Asegurar que edge_attr tenga la forma correcta [num_edges, 1]
+                if edge_attr.dim() == 1:
+                    edge_attr = edge_attr.unsqueeze(1)
+                # Verificar que el número de arcos coincide
+                assert edge_attr.size(0) == edge_index.size(1), \
+                    f"Mismatch: edge_attr tiene {edge_attr.size(0)} elementos pero hay {edge_index.size(1)} arcos"
+            else:
+                # Si no hay arcos, crear edge_attr vacío con forma correcta
+                edge_attr = torch.zeros((0, 1), dtype=torch.float, device=x.device)
             
             # GINE encoding: propaga información considerando pesos de atención
             x = F.relu(self.conv1(x, edge_index, edge_attr))
@@ -285,9 +293,17 @@ class GVAELSTM(nn.Module):
         
     def encode(self, x, edge_index, edge_attr, batch):
         """Encoder: grafo (con edge features) → distribución latente"""
-        # Asegurar que edge_attr tenga la forma correcta [num_edges, 1]
-        if edge_attr.dim() == 1:
-            edge_attr = edge_attr.unsqueeze(1)
+        # Manejo seguro de edge_attr
+        if edge_attr is not None and edge_attr.numel() > 0:
+            # Asegurar que edge_attr tenga la forma correcta [num_edges, 1]
+            if edge_attr.dim() == 1:
+                edge_attr = edge_attr.unsqueeze(1)
+            # Verificar que el número de arcos coincide
+            assert edge_attr.size(0) == edge_index.size(1), \
+                f"Mismatch: edge_attr tiene {edge_attr.size(0)} elementos pero hay {edge_index.size(1)} arcos"
+        else:
+            # Si no hay arcos, crear edge_attr vacío con forma correcta
+            edge_attr = torch.zeros((0, 1), dtype=torch.float, device=x.device)
         
         # GINE: usa edge features (pesos de atención)
         x = F.relu(self.conv1(x, edge_index, edge_attr))
@@ -491,15 +507,54 @@ def collate_sequential_batch(batch):
     """
     from torch_geometric.data import Batch as PyGBatch
     
+    if len(batch) == 0:
+        raise ValueError("Batch vacío recibido en collate_fn")
+    
     batch_size = len(batch)
     num_layers = len(batch[0][0])
     
     # Reorganizar: en lugar de [batch][layer], queremos [layer][batch]
     batched_by_layer = []
     for layer_idx in range(num_layers):
-        layer_graphs = [item[0][layer_idx] for item in batch]
-        batched_layer = PyGBatch.from_data_list(layer_graphs)
-        batched_by_layer.append(batched_layer)
+        try:
+            layer_graphs = [item[0][layer_idx] for item in batch]
+            
+            # Validar que todos los grafos tengan edge_attr
+            for i, graph in enumerate(layer_graphs):
+                if graph.edge_attr is None or graph.edge_attr.numel() == 0:
+                    # Si no hay edge_attr, crear uno vacío con forma correcta
+                    graph.edge_attr = torch.zeros((0, 1), dtype=torch.float)
+                elif graph.edge_attr.dim() == 1:
+                    # Asegurar que sea 2D
+                    graph.edge_attr = graph.edge_attr.unsqueeze(1)
+                
+                # Verificar consistencia entre edge_index y edge_attr
+                num_edges = graph.edge_index.size(1)
+                if graph.edge_attr.size(0) != num_edges:
+                    # Crear edge_attr del tamaño correcto si hay mismatch
+                    print(f"WARNING: Corrigiendo edge_attr en capa {layer_idx}, grafo {i}: "
+                          f"{graph.edge_attr.size(0)} != {num_edges}")
+                    if num_edges > 0:
+                        # Tomar los primeros num_edges o rellenar con zeros
+                        if graph.edge_attr.size(0) > num_edges:
+                            graph.edge_attr = graph.edge_attr[:num_edges]
+                        else:
+                            # Rellenar con valores promedio
+                            padding = torch.zeros((num_edges - graph.edge_attr.size(0), 1), 
+                                                 dtype=torch.float)
+                            graph.edge_attr = torch.cat([graph.edge_attr, padding], dim=0)
+                    else:
+                        graph.edge_attr = torch.zeros((0, 1), dtype=torch.float)
+            
+            batched_layer = PyGBatch.from_data_list(layer_graphs)
+            batched_by_layer.append(batched_layer)
+        except Exception as e:
+            print(f"Error al procesar capa {layer_idx}: {e}")
+            print(f"Número de grafos en batch: {len(layer_graphs)}")
+            for i, graph in enumerate(layer_graphs):
+                print(f"  Grafo {i}: nodes={graph.num_nodes}, edges={graph.edge_index.size(1)}, "
+                      f"edge_attr={'None' if graph.edge_attr is None else graph.edge_attr.shape}")
+            raise
     
     labels = torch.stack([item[1] for item in batch])
     question_ids = [item[2] for item in batch]
@@ -1013,7 +1068,7 @@ if __name__ == '__main__':
                        help='Patrón glob para archivos .pkl (ej: "traces_data/*.pkl")')
     parser.add_argument('--scores-file', type=str, required=True,
                        help='Archivo CSV con scores BLEURT')
-    parser.add_argument('--attn-threshold', type=float, default=0.01,
+    parser.add_argument('--attn-threshold', type=float, default=0.0,
                        help='Umbral de atención para crear arcos')
     parser.add_argument('--score-threshold', type=float, default=0.5,
                        help='Umbral de score BLEURT para etiquetar alucinaciones (score < threshold = alucinación)')
