@@ -33,6 +33,7 @@ from pathlib import Path
 import argparse
 from tqdm import tqdm
 import json
+import gc
 from datetime import datetime
 from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, accuracy_score, precision_score, recall_score, f1_score
 
@@ -499,11 +500,11 @@ class SequentialTraceDataset:
     - label = 1 si score < threshold (alucinación)
     - label = 0 si score >= threshold (no alucinación)
     """
-    def __init__(self, pkl_files_pattern, scores_file, attn_threshold=0.01, score_threshold=0.5):
+    def __init__(self, pkl_files_pattern, scores_file, attn_threshold=0.01, score_threshold=0.5, lazy_loading=True):
         from dataloader import TraceGraphDataset
         
-        # Cargar dataset de grafos
-        self.graph_dataset = TraceGraphDataset(pkl_files_pattern, attn_threshold)
+        # Cargar dataset de grafos CON LAZY LOADING
+        self.graph_dataset = TraceGraphDataset(pkl_files_pattern, attn_threshold, lazy_loading=lazy_loading)
         
         # Cargar scores y convertir a etiquetas binarias
         scores_df = pd.read_csv(scores_file)
@@ -519,7 +520,12 @@ class SequentialTraceDataset:
             self.labels_dict[qid] = 1 if score < score_threshold else 0
         
         self.num_layers = self.graph_dataset.num_layers
-        self.num_traces = len(self.graph_dataset.all_traces)
+        
+        # CAMBIO: Calcular num_traces de forma compatible con lazy loading
+        if lazy_loading:
+            self.num_traces = len(self.graph_dataset) // self.num_layers
+        else:
+            self.num_traces = len(self.graph_dataset.all_traces)
         
         # Calcular estadísticas de balance de clases
         labels_values = list(self.labels_dict.values())
@@ -531,6 +537,7 @@ class SequentialTraceDataset:
         print(f"  - {self.num_layers} capas por trace")
         print(f"  - {len(self.scores_dict)} scores cargados")
         print(f"  - Score threshold: {score_threshold}")
+        print(f"  - Lazy loading: {lazy_loading}")
         print(f"  - Balance de clases:")
         print(f"    * Alucinaciones (1): {num_hallucinations} ({100*num_hallucinations/len(labels_values):.1f}%)")
         print(f"    * No alucinaciones (0): {num_correct} ({100*num_correct/len(labels_values):.1f}%)")
@@ -639,7 +646,10 @@ def collate_sequential_batch(batch):
 # ============================================================================
 
 def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0.001):
-    """Entrena el modelo LSTM Baseline con clasificación binaria"""
+    """
+    Entrena el modelo LSTM Baseline con clasificación binaria.
+    OPTIMIZADO PARA MEMORIA: Libera memoria GPU/RAM regularmente.
+    """
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     criterion = nn.BCEWithLogitsLoss()  # BCE con logits (más estable numéricamente)
@@ -658,7 +668,6 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
             layer_sequence = []
             for layer_data in batched_by_layer:
                 # Promedio global de nodos por grafo
-                from torch_geometric.nn import global_mean_pool
                 layer_repr = global_mean_pool(layer_data.x.to(device), 
                                               layer_data.batch.to(device))
                 layer_sequence.append(layer_repr)
@@ -672,6 +681,14 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
             optimizer.step()
             
             train_loss += loss.item()
+            
+            # Liberar memoria
+            del layer_sequence, logits, loss, labels
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # Liberar memoria después del training
+        gc.collect()
         
         # Validation
         model.eval()
@@ -686,7 +703,6 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
                 
                 layer_sequence = []
                 for layer_data in batched_by_layer:
-                    from torch_geometric.nn import global_mean_pool
                     layer_repr = global_mean_pool(layer_data.x.to(device),
                                                   layer_data.batch.to(device))
                     layer_sequence.append(layer_repr)
@@ -704,6 +720,14 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
                 all_probs.extend(probs.cpu().numpy().flatten())
                 all_labels.extend(labels.cpu().numpy().flatten())
                 all_preds.extend(preds.cpu().numpy().flatten())
+                
+                # Liberar memoria
+                del layer_sequence, logits, loss, probs, preds, labels
+        
+        # Liberar memoria después de validation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
         
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
@@ -730,7 +754,10 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
 
 
 def train_gnn_det_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.001):
-    """Entrena el modelo GNN-det+LSTM con clasificación binaria"""
+    """
+    Entrena el modelo GNN-det+LSTM con clasificación binaria.
+    OPTIMIZADO PARA MEMORIA: Libera memoria GPU/RAM regularmente.
+    """
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     criterion = nn.BCEWithLogitsLoss()
@@ -754,6 +781,14 @@ def train_gnn_det_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.
             optimizer.step()
             
             train_loss += loss.item()
+            
+            # Liberar memoria
+            del logits, loss, labels
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # Liberar memoria después del training
+        gc.collect()
         
         model.eval()
         val_loss = 0
@@ -777,6 +812,14 @@ def train_gnn_det_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.
                 all_probs.extend(probs.cpu().numpy().flatten())
                 all_labels.extend(labels.cpu().numpy().flatten())
                 all_preds.extend(preds.cpu().numpy().flatten())
+                
+                # Liberar memoria
+                del logits, loss, probs, preds, labels
+        
+        # Liberar memoria después de validation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
         
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
@@ -803,7 +846,10 @@ def train_gnn_det_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.
 
 
 def train_gvae_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.001, kl_weight=0.001):
-    """Entrena el modelo GVAE+LSTM con clasificación binaria"""
+    """
+    Entrena el modelo GVAE+LSTM con clasificación binaria.
+    OPTIMIZADO PARA MEMORIA: Libera memoria GPU/RAM regularmente.
+    """
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     criterion = nn.BCEWithLogitsLoss()
@@ -844,6 +890,15 @@ def train_gvae_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.001
             train_loss += loss.item()
             train_task_loss += task_loss.item()
             train_vae_loss += vae_loss_total.item()
+            
+            # Liberar memoria
+            del logits, mu_list, logvar_list, orig_list, recon_list
+            del task_loss, vae_loss_total, loss, labels
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # Liberar memoria después del training
+        gc.collect()
         
         model.eval()
         val_loss = 0
@@ -867,6 +922,14 @@ def train_gvae_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.001
                 all_probs.extend(probs.cpu().numpy().flatten())
                 all_labels.extend(labels.cpu().numpy().flatten())
                 all_preds.extend(preds.cpu().numpy().flatten())
+                
+                # Liberar memoria
+                del logits, loss, probs, preds, labels
+        
+        # Liberar memoria después de validation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
         
         train_loss /= len(train_loader)
         train_task_loss /= len(train_loader)
