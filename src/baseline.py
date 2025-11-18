@@ -37,8 +37,6 @@ import gc
 from datetime import datetime
 from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, accuracy_score, precision_score, recall_score, f1_score
 
-from dataloader import TraceGraphDataset
-
 
 # ============================================================================
 # MODELO 1: LSTM-solo (Baseline sin estructura)
@@ -499,24 +497,17 @@ def vae_loss(recon_x, x, mu, logvar, kl_weight=0.001):
 
 class SequentialTraceDataset:
     """
-    Dataset que organiza grafos por trace completo (todas las capas juntas)
-    en lugar de grafos individuales.
+    Dataset simplificado que carga archivos .pkl.gz DIRECTAMENTE sin lazy loading complejo.
+    Carga solo el número necesario de archivos en memoria.
     
     Aplica threshold sobre scores BLEURT para obtener etiquetas binarias:
     - label = 1 si score < threshold (alucinación)
     - label = 0 si score >= threshold (no alucinación)
     """
-    def __init__(self, pkl_files_pattern, scores_file, attn_threshold=0.01, score_threshold=0.5, lazy_loading=True, max_files=None, max_traces_total=None):
-        from dataloader import TraceGraphDataset
-        
-        # Cargar dataset de grafos CON LAZY LOADING y límite de archivos/traces
-        self.graph_dataset = TraceGraphDataset(
-            pkl_files_pattern, 
-            attn_threshold, 
-            lazy_loading=lazy_loading,
-            max_files=max_files,
-            max_traces_total=max_traces_total
-        )
+    def __init__(self, pkl_files_pattern, scores_file, attn_threshold=0.01, score_threshold=0.5, max_traces_total=None):
+        import glob
+        import pickle
+        import gzip
         
         # Cargar scores y convertir a etiquetas binarias
         scores_df = pd.read_csv(scores_file)
@@ -531,31 +522,122 @@ class SequentialTraceDataset:
             # label = 1 si es alucinación (score bajo), 0 si no
             self.labels_dict[qid] = 1 if score < score_threshold else 0
         
-        self.num_layers = self.graph_dataset.num_layers
+        # Buscar archivos
+        print("Buscando archivos pkl/pkl.gz...")
+        file_paths = glob.glob(pkl_files_pattern)
+        if not pkl_files_pattern.endswith('.gz') and not pkl_files_pattern.endswith('*'):
+            file_paths.extend(glob.glob(pkl_files_pattern.replace('.pkl', '.pkl.gz')))
         
-        # CAMBIO: Calcular num_traces de forma compatible con lazy loading
-        if lazy_loading:
-            self.num_traces = len(self.graph_dataset) // self.num_layers
-        else:
-            self.num_traces = len(self.graph_dataset.all_traces)
+        file_paths = sorted(list(set([f for f in file_paths if not f.endswith('.part')])))
+        print(f"Encontrados {len(file_paths)} archivos.")
         
-        # Calcular estadísticas de balance de clases
+        if not file_paths:
+            raise ValueError("No se encontraron archivos .pkl o .pkl.gz")
+        
+        # Cargar traces directamente en memoria
+        self.all_traces = []
+        self.attn_threshold = attn_threshold
+        traces_loaded = 0
+        
+        print(f"Cargando archivos .pkl.gz...")
+        for file_path in tqdm(file_paths, desc="Cargando"):
+            # Si ya tenemos suficientes traces, parar
+            if max_traces_total is not None and traces_loaded >= max_traces_total:
+                print(f"⚠️  Alcanzado límite de {max_traces_total} traces")
+                break
+            
+            # Cargar archivo
+            if file_path.endswith('.gz'):
+                with gzip.open(file_path, 'rb') as f:
+                    batch_data = pickle.load(f)
+            else:
+                with open(file_path, 'rb') as f:
+                    batch_data = pickle.load(f)
+            
+            # Determinar cuántos traces tomar de este archivo
+            if max_traces_total is not None:
+                traces_to_take = min(len(batch_data), max_traces_total - traces_loaded)
+                self.all_traces.extend(batch_data[:traces_to_take])
+                traces_loaded += traces_to_take
+            else:
+                self.all_traces.extend(batch_data)
+                traces_loaded += len(batch_data)
+        
+        if not self.all_traces:
+            raise ValueError("No se cargaron traces")
+        
+        self.num_layers = len(self.all_traces[0]['hidden_states'])
+        self.num_traces = len(self.all_traces)
+        
+        print(f"\nDataset creado:")
+        print(f"  - {self.num_traces} traces cargados")
+        print(f"  - {self.num_layers} capas por trace")
+        print(f"  - {len(self.scores_dict)} scores disponibles")
+        print(f"  - Score threshold: {score_threshold}")
+        
+        # Estadísticas de balance de clases
         labels_values = list(self.labels_dict.values())
         num_hallucinations = sum(labels_values)
         num_correct = len(labels_values) - num_hallucinations
-        
-        print(f"Dataset secuencial creado:")
-        print(f"  - {self.num_traces} traces")
-        print(f"  - {self.num_layers} capas por trace")
-        print(f"  - {len(self.scores_dict)} scores cargados")
-        print(f"  - Score threshold: {score_threshold}")
-        print(f"  - Lazy loading: {lazy_loading}")
         print(f"  - Balance de clases:")
         print(f"    * Alucinaciones (1): {num_hallucinations} ({100*num_hallucinations/len(labels_values):.1f}%)")
         print(f"    * No alucinaciones (0): {num_correct} ({100*num_correct/len(labels_values):.1f}%)")
     
     def __len__(self):
         return self.num_traces
+    
+    def _trace_to_graph(self, trace, layer_idx):
+        """
+        Convierte un trace y una capa específica en un grafo de PyG.
+        """
+        from torch_geometric.data import Data
+        
+        # Nodos: hidden_states de la capa
+        hidden_states = trace['hidden_states'][layer_idx]
+        attentions = trace['attentions'][layer_idx]
+        
+        seq_len, hidden_dim = hidden_states.shape
+        
+        # Convertir a torch
+        if isinstance(hidden_states, np.ndarray):
+            x = torch.from_numpy(hidden_states).float()
+        else:
+            x = hidden_states.float()
+        
+        # Crear arcos desde matriz de atención
+        # Promediar sobre heads
+        if isinstance(attentions, np.ndarray):
+            attn_avg = torch.from_numpy(attentions).float().mean(dim=0)
+        else:
+            attn_avg = attentions.float().mean(dim=0)
+        
+        # Crear arcos donde atención > threshold
+        edge_list = []
+        edge_weights = []
+        
+        for i in range(seq_len):
+            for j in range(seq_len):
+                if i != j and attn_avg[i, j] > self.attn_threshold:
+                    # i está prestando atención a j
+                    edge_list.append([i, j])
+                    edge_weights.append(attn_avg[i, j].item())
+        
+        if edge_list:
+            edge_index = torch.tensor(edge_list, dtype=torch.long).t()
+            edge_attr = torch.tensor(edge_weights, dtype=torch.float).unsqueeze(1)
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+            edge_attr = torch.empty((0, 1), dtype=torch.float)
+        
+        # Crear objeto Data de PyG
+        data = Data(
+            x=x,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            question_id=trace['question_id']
+        )
+        
+        return data
     
     def __getitem__(self, trace_idx):
         """
@@ -566,17 +648,14 @@ class SequentialTraceDataset:
             label: Etiqueta binaria (0 o 1)
             question_id: ID de la pregunta
         """
-        graphs_by_layer = []
-        question_id = None
+        trace = self.all_traces[trace_idx]
+        question_id = trace['question_id']
         
+        # Crear grafos para todas las capas
+        graphs_by_layer = []
         for layer_idx in range(self.num_layers):
-            # Calcular índice global en el dataset plano
-            global_idx = trace_idx * self.num_layers + layer_idx
-            graph = self.graph_dataset[global_idx]
+            graph = self._trace_to_graph(trace, layer_idx)
             graphs_by_layer.append(graph)
-            
-            if question_id is None:
-                question_id = graph.question_id
         
         # Obtener etiqueta binaria
         label = self.labels_dict.get(question_id, 0)
