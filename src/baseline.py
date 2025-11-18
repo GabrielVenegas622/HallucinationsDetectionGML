@@ -662,14 +662,19 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
         model.train()
         train_loss = 0
         for batched_by_layer, labels, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
-            labels = labels.to(device).unsqueeze(1)
+            labels = labels.to(device, non_blocking=True).unsqueeze(1)
+            
+            # OPTIMIZACIÓN: Transferir todas las capas a GPU de una vez
+            batched_by_layer_gpu = []
+            for layer_data in batched_by_layer:
+                layer_data_gpu = layer_data.to(device, non_blocking=True)
+                batched_by_layer_gpu.append(layer_data_gpu)
             
             # Extraer secuencia: promediar nodos de cada grafo en cada capa
             layer_sequence = []
-            for layer_data in batched_by_layer:
-                # Promedio global de nodos por grafo
-                layer_repr = global_mean_pool(layer_data.x.to(device), 
-                                              layer_data.batch.to(device))
+            for layer_data in batched_by_layer_gpu:
+                # Promedio global de nodos por grafo (ya en GPU)
+                layer_repr = global_mean_pool(layer_data.x, layer_data.batch)
                 layer_sequence.append(layer_repr)
             
             layer_sequence = torch.stack(layer_sequence, dim=1)  # [batch, layers, dim]
@@ -683,7 +688,7 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
             train_loss += loss.item()
             
             # Liberar memoria
-            del layer_sequence, logits, loss, labels
+            del layer_sequence, logits, loss, labels, batched_by_layer_gpu
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         
@@ -699,12 +704,17 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
         
         with torch.no_grad():
             for batched_by_layer, labels, _ in val_loader:
-                labels = labels.to(device).unsqueeze(1)
+                labels = labels.to(device, non_blocking=True).unsqueeze(1)
+                
+                # OPTIMIZACIÓN: Transferir todas las capas a GPU de una vez
+                batched_by_layer_gpu = []
+                for layer_data in batched_by_layer:
+                    layer_data_gpu = layer_data.to(device, non_blocking=True)
+                    batched_by_layer_gpu.append(layer_data_gpu)
                 
                 layer_sequence = []
-                for layer_data in batched_by_layer:
-                    layer_repr = global_mean_pool(layer_data.x.to(device),
-                                                  layer_data.batch.to(device))
+                for layer_data in batched_by_layer_gpu:
+                    layer_repr = global_mean_pool(layer_data.x, layer_data.batch)
                     layer_sequence.append(layer_repr)
                 
                 layer_sequence = torch.stack(layer_sequence, dim=1)
@@ -722,7 +732,7 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
                 all_preds.extend(preds.cpu().numpy().flatten())
                 
                 # Liberar memoria
-                del layer_sequence, logits, loss, probs, preds, labels
+                del layer_sequence, logits, loss, probs, preds, labels, batched_by_layer_gpu
         
         # Liberar memoria después de validation
         if torch.cuda.is_available():
@@ -1023,14 +1033,42 @@ def run_ablation_experiments(args):
     print(f"  Val: {len(val_dataset)}")
     print(f"  Test: {len(test_dataset)}")
     
-    # Crear dataloaders
+    # Crear dataloaders con prefetching optimizado
     from torch.utils.data import DataLoader
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
-                              shuffle=True, collate_fn=collate_sequential_batch)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
-                            shuffle=False, collate_fn=collate_sequential_batch)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
-                             shuffle=False, collate_fn=collate_sequential_batch)
+    
+    # Configurar num_workers basado en CPU cores disponibles
+    import os
+    num_workers = min(4, os.cpu_count() or 1)
+    
+    print(f"\nConfigurando DataLoaders:")
+    print(f"  - num_workers: {num_workers} (prefetching paralelo)")
+    print(f"  - pin_memory: True (transferencias GPU más rápidas)")
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size,
+        shuffle=True, 
+        collate_fn=collate_sequential_batch,
+        num_workers=num_workers,
+        pin_memory=device.type == 'cuda',  # Solo con CUDA
+        persistent_workers=num_workers > 0  # Mantener workers vivos
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=args.batch_size,
+        shuffle=False, 
+        collate_fn=collate_sequential_batch,
+        num_workers=num_workers,
+        pin_memory=device.type == 'cuda'
+    )
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=args.batch_size,
+        shuffle=False, 
+        collate_fn=collate_sequential_batch,
+        num_workers=num_workers,
+        pin_memory=device.type == 'cuda'
+    )
     
     # Obtener dimensiones
     sample_graph = full_dataset[0][0][0]

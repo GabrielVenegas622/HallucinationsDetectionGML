@@ -59,7 +59,8 @@ class TraceGraphDataset(TorchDataset):
             self.file_paths = sorted(file_paths)
             self.file_index_map = []  # (file_idx, trace_in_file_idx, layer_idx)
             self._file_cache = {}  # Cache LRU simple
-            self._cache_max_size = 2  # Mantener máximo 2 archivos en cache
+            self._cache_max_size = 6  # Aumentado de 2 a 6 para mejor rendimiento
+            self._cache_order = []  # Para implementar LRU
             
             # Leer el primer archivo para detectar num_layers y contar traces por archivo
             print("Escaneando estructura de archivos...")
@@ -135,15 +136,18 @@ class TraceGraphDataset(TorchDataset):
     
     def _load_file(self, file_idx):
         """
-        Carga un archivo con cache LRU simple.
+        Carga un archivo con cache LRU (Least Recently Used).
         """
         if file_idx in self._file_cache:
+            # Mover al final (más recientemente usado)
+            self._cache_order.remove(file_idx)
+            self._cache_order.append(file_idx)
             return self._file_cache[file_idx]
         
         # Limpiar cache si está lleno
         if len(self._file_cache) >= self._cache_max_size:
-            # Eliminar el elemento más antiguo (primera clave)
-            oldest_key = next(iter(self._file_cache))
+            # Eliminar el elemento menos recientemente usado (primero en la lista)
+            oldest_key = self._cache_order.pop(0)
             del self._file_cache[oldest_key]
             gc.collect()
         
@@ -157,6 +161,7 @@ class TraceGraphDataset(TorchDataset):
                 batch_data = pickle.load(f)
         
         self._file_cache[file_idx] = batch_data
+        self._cache_order.append(file_idx)
         return batch_data
     
     def __getitem__(self, idx):
