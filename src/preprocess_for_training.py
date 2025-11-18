@@ -1,11 +1,14 @@
 """
-Script de pre-procesamiento para aceler training.
+Script de pre-procesamiento para acelerar training.
 
 Este script:
 1. Carga TODOS los traces desde archivos .pkl/.pkl.gz
 2. Genera los grafos PyG para cada capa
-3. Extrae las representaciones layer_sequence (tensor compacto)
+3. Extrae SOLO el último token de cada capa (sin información estructural para LSTM-solo)
 4. Guarda en formato .pt optimizado para carga rápida
+
+IMPORTANTE: Para LSTM-solo, solo se usa el último token a través de las capas,
+no el promedio de todos los nodos, para evitar información estructural.
 
 Ventajas:
 - Reduce tiempo de carga de ~30 seg a <1 seg por batch
@@ -95,10 +98,10 @@ def preprocess_dataset(args):
         # Extraer layer sequence
         layer_sequence = []
         for graph in graphs_by_layer:
-            # Simular batch de 1 elemento
-            batch = torch.zeros(graph.num_nodes, dtype=torch.long)
-            layer_repr = global_mean_pool(graph.x, batch)  # [1, hidden_dim]
-            layer_sequence.append(layer_repr.squeeze(0))  # [hidden_dim]
+            # Para LSTM-solo: usar SOLO el último token (sin información estructural)
+            # El último nodo corresponde al último token generado
+            last_token_feature = graph.x[-1]  # [hidden_dim]
+            layer_sequence.append(last_token_feature)
         
         layer_sequence = torch.stack(layer_sequence, dim=0)  # [num_layers, hidden_dim]
         

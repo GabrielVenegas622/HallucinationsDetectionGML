@@ -48,10 +48,16 @@ class LSTMBaseline(nn.Module):
     """
     Baseline: Solo LSTM sobre la secuencia de capas.
     
-    Ignora completamente la estructura del grafo. Cada capa se representa
-    por la media de sus hidden states, creando una secuencia temporal.
+    IMPORTANTE: Ignora completamente la estructura del grafo y la información
+    de atención. Solo usa el hidden state del ÚLTIMO TOKEN de cada capa,
+    creando una secuencia temporal que compara cómo evoluciona el último
+    token a través de las capas.
+    
+    Esto es clave para la ablación: NO tiene información estructural,
+    solo la evolución temporal del token final.
     
     Input: Secuencia de num_layers vectores (cada uno de dim hidden_dim)
+           donde cada vector es el hidden state del último token en esa capa
     Output: Score de hallucination
     """
     def __init__(self, hidden_dim, lstm_hidden=256, num_lstm_layers=2, dropout=0.3):
@@ -670,11 +676,25 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
                 layer_data_gpu = layer_data.to(device, non_blocking=True)
                 batched_by_layer_gpu.append(layer_data_gpu)
             
-            # Extraer secuencia: promediar nodos de cada grafo en cada capa
+            # Extraer secuencia: SOLO ÚLTIMO TOKEN (sin información estructural)
+            # Esto es clave para LSTM-solo: comparar el último token a través de capas
             layer_sequence = []
             for layer_data in batched_by_layer_gpu:
-                # Promedio global de nodos por grafo (ya en GPU)
-                layer_repr = global_mean_pool(layer_data.x, layer_data.batch)
+                # Extraer hidden states del último token de cada grafo en el batch
+                batch_size = layer_data.batch.max().item() + 1
+                last_token_features = []
+                
+                for batch_idx in range(batch_size):
+                    # Obtener nodos de este grafo en el batch
+                    node_mask = (layer_data.batch == batch_idx)
+                    graph_nodes = layer_data.x[node_mask]
+                    
+                    # Tomar el ÚLTIMO nodo (último token)
+                    last_token = graph_nodes[-1]  # [hidden_dim]
+                    last_token_features.append(last_token)
+                
+                # Stack para crear batch
+                layer_repr = torch.stack(last_token_features, dim=0)  # [batch, hidden_dim]
                 layer_sequence.append(layer_repr)
             
             layer_sequence = torch.stack(layer_sequence, dim=1)  # [batch, layers, dim]
@@ -712,9 +732,24 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
                     layer_data_gpu = layer_data.to(device, non_blocking=True)
                     batched_by_layer_gpu.append(layer_data_gpu)
                 
+                # Extraer secuencia: SOLO ÚLTIMO TOKEN (sin información estructural)
                 layer_sequence = []
                 for layer_data in batched_by_layer_gpu:
-                    layer_repr = global_mean_pool(layer_data.x, layer_data.batch)
+                    # Extraer hidden states del último token de cada grafo en el batch
+                    batch_size = layer_data.batch.max().item() + 1
+                    last_token_features = []
+                    
+                    for batch_idx in range(batch_size):
+                        # Obtener nodos de este grafo en el batch
+                        node_mask = (layer_data.batch == batch_idx)
+                        graph_nodes = layer_data.x[node_mask]
+                        
+                        # Tomar el ÚLTIMO nodo (último token)
+                        last_token = graph_nodes[-1]  # [hidden_dim]
+                        last_token_features.append(last_token)
+                    
+                    # Stack para crear batch
+                    layer_repr = torch.stack(last_token_features, dim=0)  # [batch, hidden_dim]
                     layer_sequence.append(layer_repr)
                 
                 layer_sequence = torch.stack(layer_sequence, dim=1)
@@ -1016,6 +1051,13 @@ def run_ablation_experiments(args):
         score_threshold=args.score_threshold
     )
     
+    # Limitar número de traces si se especifica
+    if args.max_traces is not None and args.max_traces < len(full_dataset):
+        print(f"\n⚠️  Limitando dataset a {args.max_traces} traces (de {len(full_dataset)} totales)")
+        from torch.utils.data import Subset
+        indices = list(range(args.max_traces))
+        full_dataset = Subset(full_dataset, indices)
+    
     # Split train/val/test
     total_size = len(full_dataset)
     train_size = int(0.7 * total_size)
@@ -1258,6 +1300,8 @@ if __name__ == '__main__':
                        help='Umbral de atención para crear arcos')
     parser.add_argument('--score-threshold', type=float, default=0.5,
                        help='Umbral de score BLEURT para etiquetar alucinaciones (score < threshold = alucinación)')
+    parser.add_argument('--max-traces', type=int, default=None,
+                       help='Número máximo de traces a cargar (None = todos)')
     
     # Entrenamiento
     parser.add_argument('--epochs', type=int, default=50,
