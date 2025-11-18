@@ -180,6 +180,27 @@ def load_ground_truth_dataset(dataset_name):
     return ground_truth
 
 
+def extract_batch_info_from_filename(filename):
+    """
+    Extrae el número de batch y sub-batch del nombre de archivo.
+    Formato esperado: *_batch_XXXX_subYYYY.pkl.gz
+    
+    Args:
+        filename: Nombre del archivo
+        
+    Returns:
+        int: batch_index calculado como 4*batch_number + sub_number, o -1 si no se puede extraer
+    """
+    import re
+    match = re.search(r'batch_(\d+)_sub(\d+)', filename)
+    if match:
+        batch_num = int(match.group(1))
+        sub_num = int(match.group(2))
+        # Fórmula: 4*batch_number + sub_number
+        return 4 * batch_num + sub_num
+    return -1
+
+
 def load_traces_from_pkl_lazy(traces_dir, dataset_name):
     """
     Generador que carga traces desde archivos .pkl o .pkl.gz de forma lazy,
@@ -190,7 +211,8 @@ def load_traces_from_pkl_lazy(traces_dir, dataset_name):
         dataset_name: Nombre del dataset para filtrar archivos
         
     Yields:
-        dict: trace_data individual
+        tuple: (batch_index, trace_data)
+            batch_index: índice calculado como 4*batch_number + sub_number
     """
     traces_dir = Path(traces_dir)
     
@@ -214,6 +236,12 @@ def load_traces_from_pkl_lazy(traces_dir, dataset_name):
     
     # Procesar archivos de forma lazy
     for file_path in tqdm(all_files, desc="Procesando archivos"):
+        # Extraer índice del batch desde el nombre del archivo
+        batch_index = extract_batch_info_from_filename(file_path.name)
+        
+        if batch_index == -1:
+            print(f"⚠️  No se pudo extraer batch info de: {file_path.name}, usando -1")
+        
         # Cargar archivo
         if file_path.suffix == '.gz':
             with gzip.open(file_path, 'rb') as f:
@@ -222,9 +250,9 @@ def load_traces_from_pkl_lazy(traces_dir, dataset_name):
             with open(file_path, 'rb') as f:
                 batch_traces = pickle.load(f)
         
-        # Yield cada trace individualmente
+        # Yield cada trace individualmente con el índice del batch
         for trace in batch_traces:
-            yield trace
+            yield batch_index, trace
         
         # Liberar memoria después de procesar cada archivo
         del batch_traces
@@ -236,6 +264,7 @@ def generate_ground_truth_scores(args):
     """
     Función principal que genera el archivo con scores BLEURT.
     OPTIMIZADO PARA MEMORIA: Usa lazy loading y procesa traces incrementalmente.
+    Genera archivos separados por batch para evitar colisiones.
     
     Args:
         args: Argumentos de línea de comandos
@@ -256,15 +285,17 @@ def generate_ground_truth_scores(args):
     print("CALCULANDO SCORES BLEURT (MAX sobre todas las referencias) - MODO LAZY")
     print("="*80)
     
-    results = []
+    # Diccionario para agrupar resultados por batch index
+    results_by_batch = {}
     missing_ground_truth = 0
     total_comparisons = 0
+    total_traces = 0
     
     # Usar generador lazy en lugar de cargar todo en memoria
     trace_generator = load_traces_from_pkl_lazy(args.traces_dir, args.dataset)
     
     # Procesar traces uno a uno
-    for trace in trace_generator:
+    for batch_index, trace in trace_generator:
         question_id = trace['question_id']
         
         # Obtener respuesta generada
@@ -288,8 +319,13 @@ def generate_ground_truth_scores(args):
         )
         
         total_comparisons += len(all_scores)
+        total_traces += 1
         
-        results.append({
+        # Agrupar resultados por batch index
+        if batch_index not in results_by_batch:
+            results_by_batch[batch_index] = []
+        
+        results_by_batch[batch_index].append({
             'question_id': question_id,
             'bleurt_score': max_score,
             'generated_answer': generated_answer,
@@ -301,38 +337,67 @@ def generate_ground_truth_scores(args):
         })
         
         # Liberar memoria periódicamente cada 100 traces
-        if len(results) % 100 == 0:
+        if total_traces % 100 == 0:
             import gc
             gc.collect()
-            print(f"\n  ➜ Procesados {len(results)} traces, liberando memoria...")
+            print(f"\n  ➜ Procesados {total_traces} traces, liberando memoria...")
     
-    print(f"\n✅ Procesamiento completado: {len(results)} traces")
+    print(f"\n✅ Procesamiento completado: {total_traces} traces desde {len(results_by_batch)} batches")
     
-    # 4. Crear DataFrame y guardar resultados
-    df = pd.DataFrame(results)
+    # 4. Guardar resultados por batch
+    output_dir = Path(args.output).parent
+    output_base = Path(args.output).stem
+    output_ext = Path(args.output).suffix
     
-    # Ordenar por question_id
+    all_results = []
+    
+    for batch_idx, results in sorted(results_by_batch.items()):
+        # Crear DataFrame para este batch
+        df = pd.DataFrame(results)
+        df = df.sort_values('question_id')
+        
+        # Nombre de archivo con índice de batch (4*batch_number + sub_number)
+        output_filename = f"{output_base}_batch{batch_idx:04d}{output_ext}"
+        output_path = output_dir / output_filename
+        
+        # Guardar archivo completo con todas las columnas
+        output_full = output_dir / f"{output_base}_batch{batch_idx:04d}_full{output_ext}"
+        df_full = df.copy()
+        df_full['all_scores'] = df_full['all_scores'].apply(lambda x: ';'.join([f'{s:.4f}' for s in x]))
+        df_full.to_csv(output_full, index=False)
+        
+        # Guardar archivo simplificado
+        df_simple = df[['question_id', 'bleurt_score']]
+        df_simple.to_csv(output_path, index=False)
+        
+        print(f"  ✅ Guardado: {output_path} ({len(df)} traces)")
+        
+        # Acumular para archivo global
+        all_results.extend(results)
+    
+    # 5. Guardar archivo global consolidado
+    df = pd.DataFrame(all_results)
     df = df.sort_values('question_id')
     
-    # Guardar archivo completo con todas las columnas
+    # Archivo completo global
     full = args.output.split('.')[0] + '_full'
     output_path_full = Path(full).with_suffix('.csv')
     df_full = df.copy()
-    # Convertir la lista de scores a string para guardarla en CSV
     df_full['all_scores'] = df_full['all_scores'].apply(lambda x: ';'.join([f'{s:.4f}' for s in x]))
     df_full.to_csv(output_path_full, index=False)
-    print(f"\n✅ Archivo completo guardado: {output_path_full}")
+    print(f"\n✅ Archivo completo global guardado: {output_path_full}")
     
-    # Guardar archivo simplificado solo con id y score
+    # Archivo simplificado global
     df_simple = df[['question_id', 'bleurt_score']]
     df_simple.to_csv(args.output, index=False)
-    print(f"✅ Archivo de scores guardado: {args.output}")
+    print(f"✅ Archivo de scores global guardado: {args.output}")
     
     # 6. Estadísticas
     print("\n" + "="*80)
     print("ESTADÍSTICAS")
     print("="*80)
-    print(f"Total de traces procesados: {len(results)}")
+    print(f"Total de batches procesados: {len(results_by_batch)}")
+    print(f"Total de traces procesados: {total_traces}")
     print(f"Traces sin ground truth: {missing_ground_truth}")
     print(f"Total de comparaciones realizadas: {total_comparisons}")
     print(f"Promedio de referencias por pregunta: {df['num_references'].mean():.2f}")
