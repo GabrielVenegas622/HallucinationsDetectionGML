@@ -495,6 +495,90 @@ def vae_loss(recon_x, x, mu, logvar, kl_weight=0.001):
 # DATASET Y LOADERS PERSONALIZADOS
 # ============================================================================
 
+class PreprocessedLSTMDataset:
+    """
+    Dataset para LSTM-solo que carga archivos preprocesados (.pt).
+    Archivos generados por preprocess_for_training.py.
+    """
+    def __init__(self, preprocessed_dir):
+        self.preprocessed_dir = Path(preprocessed_dir)
+        
+        # Buscar archivos de batches
+        batch_files = sorted(list(self.preprocessed_dir.glob('batch_*.pt')))
+        if not batch_files:
+            raise ValueError(f"No se encontraron archivos batch_*.pt en {preprocessed_dir}")
+        
+        print(f"Cargando {len(batch_files)} batches preprocesados desde {preprocessed_dir}...")
+        
+        # Cargar todos los datos en memoria
+        self.sequences = []
+        self.labels = []
+        self.question_ids = []
+        
+        for batch_file in tqdm(batch_files, desc="Cargando batches"):
+            batch_data = torch.load(batch_file)
+            self.sequences.append(batch_data['sequences'])  # [N, num_layers, hidden_dim]
+            self.labels.append(batch_data['labels'])  # [N]
+            self.question_ids.extend(batch_data['question_ids'])
+        
+        # Concatenar todos los batches
+        self.sequences = torch.cat(self.sequences, dim=0)
+        self.labels = torch.cat(self.labels, dim=0)
+        
+        print(f"Dataset LSTM-solo cargado: {len(self)} traces")
+    
+    def __len__(self):
+        return len(self.labels)
+    
+    def __getitem__(self, idx):
+        return self.sequences[idx], self.labels[idx], self.question_ids[idx]
+
+
+class PreprocessedGNNDataset:
+    """
+    Dataset para GNN-det+LSTM y GVAE que carga grafos preprocesados (.pt).
+    Archivos generados por preprocess_for_training.py.
+    """
+    def __init__(self, preprocessed_dir):
+        self.preprocessed_dir = Path(preprocessed_dir)
+        
+        # Buscar archivos de batches
+        batch_files = sorted(list(self.preprocessed_dir.glob('batch_*.pt')))
+        if not batch_files:
+            raise ValueError(f"No se encontraron archivos batch_*.pt en {preprocessed_dir}")
+        
+        print(f"Cargando {len(batch_files)} batches preprocesados desde {preprocessed_dir}...")
+        
+        # Cargar todos los datos en memoria
+        self.graphs_by_layer = []  # Lista de [todas las capas de todos los traces]
+        self.labels = []
+        self.question_ids = []
+        
+        for batch_file in tqdm(batch_files, desc="Cargando batches"):
+            batch_data = torch.load(batch_file)
+            self.graphs_by_layer.append(batch_data['graphs_by_layer'])  # [N traces][num_layers]
+            self.labels.append(batch_data['labels'])  # [N]
+            self.question_ids.extend(batch_data['question_ids'])
+        
+        # Reorganizar: ahora tenemos una lista de listas de listas
+        # Aplanar a una sola lista de [trace][layer]
+        all_traces_graphs = []
+        for batch_graphs in self.graphs_by_layer:
+            all_traces_graphs.extend(batch_graphs)
+        self.graphs_by_layer = all_traces_graphs
+        
+        # Concatenar labels
+        self.labels = torch.cat(self.labels, dim=0)
+        
+        print(f"Dataset GNN cargado: {len(self)} traces")
+    
+    def __len__(self):
+        return len(self.labels)
+    
+    def __getitem__(self, idx):
+        return self.graphs_by_layer[idx], self.labels[idx], self.question_ids[idx]
+
+
 class SequentialTraceDataset:
     """
     Dataset simplificado que carga archivos .pkl.gz DIRECTAMENTE sin lazy loading complejo.
@@ -661,6 +745,58 @@ class SequentialTraceDataset:
         label = self.labels_dict.get(question_id, 0)
         
         return graphs_by_layer, torch.tensor(label, dtype=torch.float), question_id
+
+
+def collate_lstm_batch(batch):
+    """
+    Collate function para batches de LSTM preprocesados.
+    
+    Args:
+        batch: Lista de (sequence, label, question_id)
+    
+    Returns:
+        sequences: Tensor [batch_size, num_layers, hidden_dim]
+        labels: Tensor [batch_size]
+        question_ids: Lista de IDs
+    """
+    sequences = torch.stack([item[0] for item in batch])
+    labels = torch.stack([item[1] for item in batch])
+    question_ids = [item[2] for item in batch]
+    
+    return sequences, labels, question_ids
+
+
+def collate_gnn_batch(batch):
+    """
+    Collate function para batches de GNN preprocesados.
+    
+    Args:
+        batch: Lista de (graphs_by_layer, label, question_id)
+        donde graphs_by_layer es una lista de Data objects de PyG
+    
+    Returns:
+        batched_by_layer: Lista de num_layers batches de PyG
+        labels: Tensor [batch_size]
+        question_ids: Lista de IDs
+    """
+    from torch_geometric.data import Batch as PyGBatch
+    
+    if len(batch) == 0:
+        raise ValueError("Batch vacío recibido en collate_fn")
+    
+    num_layers = len(batch[0][0])
+    
+    # Reorganizar: en lugar de [batch][layer], queremos [layer][batch]
+    batched_by_layer = []
+    for layer_idx in range(num_layers):
+        layer_graphs = [item[0][layer_idx] for item in batch]
+        batched_layer = PyGBatch.from_data_list(layer_graphs)
+        batched_by_layer.append(batched_layer)
+    
+    labels = torch.stack([item[1] for item in batch])
+    question_ids = [item[2] for item in batch]
+    
+    return batched_by_layer, labels, question_ids
 
 
 def collate_sequential_batch(batch):
@@ -1130,78 +1266,180 @@ def run_ablation_experiments(args):
     # Crear dataset
     print("\nCargando dataset...")
     
-    # Si se especifica max_traces, limitamos el número total de traces
-    max_traces_total = args.max_traces if args.max_traces is not None else None
+    # Determinar si usar datos preprocesados o raw
+    use_preprocessed = hasattr(args, 'preprocessed_dir') and args.preprocessed_dir is not None
     
-    if max_traces_total is not None:
-        print(f"⚠️  Limitando a {max_traces_total} traces totales")
-    
-    full_dataset = SequentialTraceDataset(
-        args.data_pattern,
-        args.scores_file,
-        attn_threshold=args.attn_threshold,
-        score_threshold=args.score_threshold,
-        max_traces_total=max_traces_total
-    )
-    
-    # Split train/val/test
-    total_size = len(full_dataset)
-    train_size = int(0.7 * total_size)
-    val_size = int(0.15 * total_size)
-    test_size = total_size - train_size - val_size
-    
-    from torch.utils.data import random_split
-    train_dataset, val_dataset, test_dataset = random_split(
-        full_dataset, [train_size, val_size, test_size],
-        generator=torch.Generator().manual_seed(42)
-    )
-    
-    print(f"\nSplit del dataset:")
-    print(f"  Train: {len(train_dataset)}")
-    print(f"  Val: {len(val_dataset)}")
-    print(f"  Test: {len(test_dataset)}")
-    
-    # Crear dataloaders con prefetching optimizado
-    from torch.utils.data import DataLoader
-    
-    # Configurar num_workers basado en CPU cores disponibles
+    from torch.utils.data import DataLoader, random_split
     import os
-    num_workers = min(4, os.cpu_count() or 1)
     
-    print(f"\nConfigurando DataLoaders:")
-    print(f"  - num_workers: {num_workers} (prefetching paralelo)")
-    print(f"  - pin_memory: True (transferencias GPU más rápidas)")
-    
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size,
-        shuffle=True, 
-        collate_fn=collate_sequential_batch,
-        num_workers=num_workers,
-        pin_memory=device.type == 'cuda',  # Solo con CUDA
-        persistent_workers=num_workers > 0  # Mantener workers vivos
-    )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=args.batch_size,
-        shuffle=False, 
-        collate_fn=collate_sequential_batch,
-        num_workers=num_workers,
-        pin_memory=device.type == 'cuda'
-    )
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=args.batch_size,
-        shuffle=False, 
-        collate_fn=collate_sequential_batch,
-        num_workers=num_workers,
-        pin_memory=device.type == 'cuda'
-    )
-    
-    # Obtener dimensiones
-    sample_graph = full_dataset[0][0][0]
-    hidden_dim = sample_graph.x.shape[1]
-    print(f"\nDimensión de hidden states: {hidden_dim}")
+    if use_preprocessed:
+        print(f"📦 Usando datos preprocesados desde: {args.preprocessed_dir}")
+        
+        # Para LSTM: cargar desde lstm_solo/
+        lstm_dir = Path(args.preprocessed_dir) / 'lstm_solo'
+        full_dataset_lstm = PreprocessedLSTMDataset(lstm_dir)
+        
+        # Para GNN: cargar desde gnn/
+        gnn_dir = Path(args.preprocessed_dir) / 'gnn'
+        full_dataset_gnn = PreprocessedGNNDataset(gnn_dir)
+        
+        # Split train/val/test (mismo split para ambos)
+        total_size = len(full_dataset_lstm)
+        train_size = int(0.7 * total_size)
+        val_size = int(0.15 * total_size)
+        test_size = total_size - train_size - val_size
+        
+        train_dataset_lstm, val_dataset_lstm, test_dataset_lstm = random_split(
+            full_dataset_lstm, [train_size, val_size, test_size],
+            generator=torch.Generator().manual_seed(42)
+        )
+        
+        train_dataset_gnn, val_dataset_gnn, test_dataset_gnn = random_split(
+            full_dataset_gnn, [train_size, val_size, test_size],
+            generator=torch.Generator().manual_seed(42)
+        )
+        
+        print(f"\nSplit del dataset:")
+        print(f"  Train: {len(train_dataset_lstm)}")
+        print(f"  Val: {len(val_dataset_lstm)}")
+        print(f"  Test: {len(test_dataset_lstm)}")
+        
+        # Configurar num_workers
+        num_workers = min(4, os.cpu_count() or 1)
+        
+        print(f"\nConfigurando DataLoaders:")
+        print(f"  - num_workers: {num_workers} (prefetching paralelo)")
+        print(f"  - pin_memory: True (transferencias GPU más rápidas)")
+        
+        # DataLoaders para LSTM
+        train_loader_lstm = DataLoader(
+            train_dataset_lstm,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=collate_lstm_batch,
+            num_workers=num_workers,
+            pin_memory=device.type == 'cuda',
+            persistent_workers=num_workers > 0
+        )
+        val_loader_lstm = DataLoader(
+            val_dataset_lstm,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=collate_lstm_batch,
+            num_workers=num_workers,
+            pin_memory=device.type == 'cuda'
+        )
+        test_loader_lstm = DataLoader(
+            test_dataset_lstm,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=collate_lstm_batch,
+            num_workers=num_workers,
+            pin_memory=device.type == 'cuda'
+        )
+        
+        # DataLoaders para GNN (usados por GNN-det+LSTM y GVAE+LSTM)
+        train_loader_gnn = DataLoader(
+            train_dataset_gnn,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=collate_gnn_batch,
+            num_workers=num_workers,
+            pin_memory=device.type == 'cuda',
+            persistent_workers=num_workers > 0
+        )
+        val_loader_gnn = DataLoader(
+            val_dataset_gnn,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=collate_gnn_batch,
+            num_workers=num_workers,
+            pin_memory=device.type == 'cuda'
+        )
+        test_loader_gnn = DataLoader(
+            test_dataset_gnn,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=collate_gnn_batch,
+            num_workers=num_workers,
+            pin_memory=device.type == 'cuda'
+        )
+        
+        # Obtener dimensiones
+        sample_seq = full_dataset_lstm[0][0]
+        hidden_dim = sample_seq.shape[-1]
+        print(f"\nDimensión de hidden states: {hidden_dim}")
+        
+    else:
+        print("📂 Usando datos raw (archivos .pkl/.pkl.gz)")
+        
+        # Si se especifica max_traces, limitamos el número total de traces
+        max_traces_total = args.max_traces if args.max_traces is not None else None
+        
+        if max_traces_total is not None:
+            print(f"⚠️  Limitando a {max_traces_total} traces totales")
+        
+        full_dataset = SequentialTraceDataset(
+            args.data_pattern,
+            args.scores_file,
+            attn_threshold=args.attn_threshold,
+            score_threshold=args.score_threshold,
+            max_traces_total=max_traces_total
+        )
+        
+        # Split train/val/test
+        total_size = len(full_dataset)
+        train_size = int(0.7 * total_size)
+        val_size = int(0.15 * total_size)
+        test_size = total_size - train_size - val_size
+        
+        train_dataset, val_dataset, test_dataset = random_split(
+            full_dataset, [train_size, val_size, test_size],
+            generator=torch.Generator().manual_seed(42)
+        )
+        
+        print(f"\nSplit del dataset:")
+        print(f"  Train: {len(train_dataset)}")
+        print(f"  Val: {len(val_dataset)}")
+        print(f"  Test: {len(test_dataset)}")
+        
+        # Configurar num_workers
+        num_workers = min(4, os.cpu_count() or 1)
+        
+        print(f"\nConfigurando DataLoaders:")
+        print(f"  - num_workers: {num_workers} (prefetching paralelo)")
+        print(f"  - pin_memory: True (transferencias GPU más rápidas)")
+        
+        train_loader_lstm = train_loader_gnn = DataLoader(
+            train_dataset, 
+            batch_size=args.batch_size,
+            shuffle=True, 
+            collate_fn=collate_sequential_batch,
+            num_workers=num_workers,
+            pin_memory=device.type == 'cuda',
+            persistent_workers=num_workers > 0
+        )
+        val_loader_lstm = val_loader_gnn = DataLoader(
+            val_dataset, 
+            batch_size=args.batch_size,
+            shuffle=False, 
+            collate_fn=collate_sequential_batch,
+            num_workers=num_workers,
+            pin_memory=device.type == 'cuda'
+        )
+        test_loader_lstm = test_loader_gnn = DataLoader(
+            test_dataset, 
+            batch_size=args.batch_size,
+            shuffle=False, 
+            collate_fn=collate_sequential_batch,
+            num_workers=num_workers,
+            pin_memory=device.type == 'cuda'
+        )
+        
+        # Obtener dimensiones
+        sample_graph = full_dataset[0][0][0]
+        hidden_dim = sample_graph.x.shape[1]
+        print(f"\nDimensión de hidden states: {hidden_dim}")
     
     results = {}
     
@@ -1223,7 +1461,7 @@ def run_ablation_experiments(args):
         print(f"Parámetros del modelo: {sum(p.numel() for p in model_lstm.parameters()):,}")
         
         history_lstm = train_lstm_baseline(
-            model_lstm, train_loader, val_loader, device,
+            model_lstm, train_loader_lstm, val_loader_lstm, device,
             epochs=args.epochs, lr=args.lr
         )
         
@@ -1253,7 +1491,7 @@ def run_ablation_experiments(args):
         print(f"Parámetros del modelo: {sum(p.numel() for p in model_gnn.parameters()):,}")
         
         history_gnn = train_gnn_det_lstm(
-            model_gnn, train_loader, val_loader, device,
+            model_gnn, train_loader_gnn, val_loader_gnn, device,
             epochs=args.epochs, lr=args.lr
         )
         
@@ -1284,7 +1522,7 @@ def run_ablation_experiments(args):
         print(f"Parámetros del modelo: {sum(p.numel() for p in model_gvae.parameters()):,}")
         
         history_gvae = train_gvae_lstm(
-            model_gvae, train_loader, val_loader, device,
+            model_gvae, train_loader_gnn, val_loader_gnn, device,
             epochs=args.epochs, lr=args.lr, kl_weight=args.kl_weight
         )
         
@@ -1378,16 +1616,18 @@ if __name__ == '__main__':
     )
     
     # Datos
-    parser.add_argument('--data-pattern', type=str, required=True,
-                       help='Patrón glob para archivos .pkl o .pkl.gz (ej: "traces_data/*.pkl*")')
-    parser.add_argument('--scores-file', type=str, required=True,
-                       help='Archivo CSV con scores BLEURT')
+    parser.add_argument('--preprocessed-dir', type=str, default=None,
+                       help='Directorio con datos preprocesados (si se especifica, se ignoran --data-pattern y --attn-threshold)')
+    parser.add_argument('--data-pattern', type=str, default=None,
+                       help='Patrón glob para archivos .pkl o .pkl.gz (ej: "traces_data/*.pkl*") [Solo si no se usa --preprocessed-dir]')
+    parser.add_argument('--scores-file', type=str, default=None,
+                       help='Archivo CSV con scores BLEURT [Solo si no se usa --preprocessed-dir]')
     parser.add_argument('--attn-threshold', type=float, default=0.0,
-                       help='Umbral de atención para crear arcos')
+                       help='Umbral de atención para crear arcos [Solo para datos raw]')
     parser.add_argument('--score-threshold', type=float, default=0.5,
                        help='Umbral de score BLEURT para etiquetar alucinaciones (score < threshold = alucinación)')
     parser.add_argument('--max-traces', type=int, default=None,
-                       help='Número máximo de traces a cargar (None = todos)')
+                       help='Número máximo de traces a cargar (None = todos) [Solo para datos raw]')
     
     # Entrenamiento
     parser.add_argument('--epochs', type=int, default=50,
@@ -1424,5 +1664,10 @@ if __name__ == '__main__':
                        help='Forzar ejecución en CPU (útil si hay problemas con CUDA)')
     
     args = parser.parse_args()
+    
+    # Validar argumentos
+    if args.preprocessed_dir is None:
+        if args.data_pattern is None or args.scores_file is None:
+            parser.error("Debe especificar --preprocessed-dir o ambos (--data-pattern y --scores-file)")
     
     run_ablation_experiments(args)
