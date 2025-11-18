@@ -8,13 +8,14 @@ Este script:
    - GNN-det+LSTM: grafos con atenciones promediadas por capa (respeta causalidad)
    - GVAE: misma estructura que GNN-det+LSTM
 3. Guarda archivos separados por batch en formato .pt
-4. Usa float16 (consistente con cuantización 4-bit del modelo)
+4. Usa float16 para reducir tamaño (baseline.py convierte a float32 automáticamente)
 
 Ventajas:
 - Reduce tiempo de carga de ~30 seg a <1 seg por batch
 - Archivos resultantes son ~10-20× más pequeños (float16 vs float32)
 - Una vez procesado, el entrenamiento es 50-100× más rápido
 - Respeta estructura causal: tokens no atienden al futuro
+- baseline.py convierte automáticamente float16 → float32 al cargar
 
 Uso:
     python preprocess_for_training.py \

@@ -951,7 +951,8 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
             # Detectar si son datos preprocesados (tensores) o raw (grafos PyG)
             if isinstance(batched_by_layer, torch.Tensor):
                 # Datos preprocesados: ya tenemos las secuencias listas
-                layer_sequence = batched_by_layer.to(device, non_blocking=True)
+                # Convertir a float32 si es necesario (preprocesamiento usa float16)
+                layer_sequence = batched_by_layer.to(device, dtype=torch.float32, non_blocking=True)
             else:
                 # Datos raw: extraer secuencia de grafos
                 # OPTIMIZACIÓN: Transferir todas las capas a GPU de una vez
@@ -1016,7 +1017,8 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
                 # Detectar si son datos preprocesados (tensores) o raw (grafos PyG)
                 if isinstance(batched_by_layer, torch.Tensor):
                     # Datos preprocesados: ya tenemos las secuencias listas
-                    layer_sequence = batched_by_layer.to(device, non_blocking=True)
+                    # Convertir a float32 si es necesario (preprocesamiento usa float16)
+                    layer_sequence = batched_by_layer.to(device, dtype=torch.float32, non_blocking=True)
                 else:
                     # Datos raw: extraer secuencia de grafos
                     # OPTIMIZACIÓN: Transferir todas las capas a GPU de una vez
