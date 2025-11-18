@@ -499,84 +499,136 @@ class PreprocessedLSTMDataset:
     """
     Dataset para LSTM-solo que carga archivos preprocesados (.pt).
     Archivos generados por preprocess_for_training.py.
+    
+    OPTIMIZADO PARA MEMORIA: Carga datos bajo demanda (lazy loading) con cache LRU.
     """
-    def __init__(self, preprocessed_dir):
+    def __init__(self, preprocessed_dir, max_cache_batches=2):
         self.preprocessed_dir = Path(preprocessed_dir)
+        self.max_cache_batches = max_cache_batches
         
         # Buscar archivos de batches (patrón: preprocessed_*.pt)
-        batch_files = sorted(list(self.preprocessed_dir.glob('preprocessed_*.pt')))
-        if not batch_files:
+        self.batch_files = sorted(list(self.preprocessed_dir.glob('preprocessed_*.pt')))
+        if not self.batch_files:
             raise ValueError(f"No se encontraron archivos preprocessed_*.pt en {preprocessed_dir}")
         
-        print(f"Cargando {len(batch_files)} batches preprocesados desde {preprocessed_dir}...")
+        print(f"Encontrados {len(self.batch_files)} archivos de batches en {preprocessed_dir}")
         
-        # Cargar todos los datos en memoria
-        self.sequences = []
-        self.labels = []
-        self.question_ids = []
+        # Construir índice: (batch_idx, idx_within_batch) para cada trace
+        self.index_map = []  # Lista de (batch_idx, local_idx, question_id)
+        self.total_traces = 0
         
-        for batch_file in tqdm(batch_files, desc="Cargando batches"):
+        print("Construyendo índice de traces...")
+        for batch_idx, batch_file in enumerate(tqdm(self.batch_files, desc="Indexando")):
             batch_data = torch.load(batch_file, weights_only=False)
-            self.sequences.append(batch_data['sequences'])  # [N, num_layers, hidden_dim]
-            self.labels.append(batch_data['labels'])  # [N]
-            self.question_ids.extend(batch_data['question_ids'])
+            num_traces_in_batch = len(batch_data['question_ids'])
+            for local_idx in range(num_traces_in_batch):
+                self.index_map.append((batch_idx, local_idx, batch_data['question_ids'][local_idx]))
+            self.total_traces += num_traces_in_batch
         
-        # Concatenar todos los batches
-        self.sequences = torch.cat(self.sequences, dim=0)
-        self.labels = torch.cat(self.labels, dim=0)
+        print(f"Dataset LSTM-solo: {self.total_traces} traces en {len(self.batch_files)} batches")
+        print(f"Cache: máximo {max_cache_batches} batches en memoria simultáneamente")
         
-        print(f"Dataset LSTM-solo cargado: {len(self)} traces")
+        # Cache LRU para batches
+        from collections import OrderedDict
+        self.batch_cache = OrderedDict()
+    
+    def _load_batch(self, batch_idx):
+        """Carga un batch con cache LRU"""
+        if batch_idx in self.batch_cache:
+            # Mover al final (más reciente)
+            self.batch_cache.move_to_end(batch_idx)
+            return self.batch_cache[batch_idx]
+        
+        # Cargar batch
+        batch_data = torch.load(self.batch_files[batch_idx], weights_only=False)
+        
+        # Agregar al cache
+        self.batch_cache[batch_idx] = batch_data
+        
+        # Eliminar batches antiguos si excede el límite
+        while len(self.batch_cache) > self.max_cache_batches:
+            oldest_batch_idx = next(iter(self.batch_cache))
+            del self.batch_cache[oldest_batch_idx]
+            gc.collect()
+        
+        return batch_data
     
     def __len__(self):
-        return len(self.labels)
+        return self.total_traces
     
     def __getitem__(self, idx):
-        return self.sequences[idx], self.labels[idx], self.question_ids[idx]
+        batch_idx, local_idx, qid = self.index_map[idx]
+        batch_data = self._load_batch(batch_idx)
+        
+        return batch_data['sequences'][local_idx], batch_data['labels'][local_idx], qid
 
 
 class PreprocessedGNNDataset:
     """
     Dataset para GNN-det+LSTM y GVAE que carga grafos preprocesados (.pt).
     Archivos generados por preprocess_for_training.py.
+    
+    OPTIMIZADO PARA MEMORIA: Carga datos bajo demanda (lazy loading) con cache LRU.
     """
-    def __init__(self, preprocessed_dir):
+    def __init__(self, preprocessed_dir, max_cache_batches=2):
         self.preprocessed_dir = Path(preprocessed_dir)
+        self.max_cache_batches = max_cache_batches
         
         # Buscar archivos de batches (patrón: preprocessed_*.pt)
-        batch_files = sorted(list(self.preprocessed_dir.glob('preprocessed_*.pt')))
-        if not batch_files:
+        self.batch_files = sorted(list(self.preprocessed_dir.glob('preprocessed_*.pt')))
+        if not self.batch_files:
             raise ValueError(f"No se encontraron archivos preprocessed_*.pt en {preprocessed_dir}")
         
-        print(f"Cargando {len(batch_files)} batches preprocesados desde {preprocessed_dir}...")
+        print(f"Encontrados {len(self.batch_files)} archivos de batches en {preprocessed_dir}")
         
-        # Cargar todos los datos en memoria
-        self.graphs_by_layer = []  # Lista de [todas las capas de todos los traces]
-        self.labels = []
-        self.question_ids = []
+        # Construir índice: (batch_idx, idx_within_batch) para cada trace
+        self.index_map = []  # Lista de (batch_idx, local_idx, question_id)
+        self.total_traces = 0
         
-        for batch_file in tqdm(batch_files, desc="Cargando batches"):
+        print("Construyendo índice de traces...")
+        for batch_idx, batch_file in enumerate(tqdm(self.batch_files, desc="Indexando")):
             batch_data = torch.load(batch_file, weights_only=False)
-            self.graphs_by_layer.append(batch_data['graphs'])  # [N traces][num_layers]
-            self.labels.append(batch_data['labels'])  # [N]
-            self.question_ids.extend(batch_data['question_ids'])
+            num_traces_in_batch = len(batch_data['question_ids'])
+            for local_idx in range(num_traces_in_batch):
+                self.index_map.append((batch_idx, local_idx, batch_data['question_ids'][local_idx]))
+            self.total_traces += num_traces_in_batch
         
-        # Reorganizar: ahora tenemos una lista de listas de listas
-        # Aplanar a una sola lista de [trace][layer]
-        all_traces_graphs = []
-        for batch_graphs in self.graphs_by_layer:
-            all_traces_graphs.extend(batch_graphs)
-        self.graphs_by_layer = all_traces_graphs
+        print(f"Dataset GNN: {self.total_traces} traces en {len(self.batch_files)} batches")
+        print(f"Cache: máximo {max_cache_batches} batches en memoria simultáneamente")
         
-        # Concatenar labels
-        self.labels = torch.cat(self.labels, dim=0)
+        # Cache LRU para batches
+        from collections import OrderedDict
+        self.batch_cache = OrderedDict()
+    
+    def _load_batch(self, batch_idx):
+        """Carga un batch con cache LRU"""
+        if batch_idx in self.batch_cache:
+            # Mover al final (más reciente)
+            self.batch_cache.move_to_end(batch_idx)
+            return self.batch_cache[batch_idx]
         
-        print(f"Dataset GNN cargado: {len(self)} traces")
+        # Cargar batch
+        batch_data = torch.load(self.batch_files[batch_idx], weights_only=False)
+        
+        # Agregar al cache
+        self.batch_cache[batch_idx] = batch_data
+        
+        # Eliminar batches antiguos si excede el límite
+        while len(self.batch_cache) > self.max_cache_batches:
+            oldest_batch_idx = next(iter(self.batch_cache))
+            del self.batch_cache[oldest_batch_idx]
+            gc.collect()
+        
+        return batch_data
     
     def __len__(self):
-        return len(self.labels)
+        return self.total_traces
     
     def __getitem__(self, idx):
-        return self.graphs_by_layer[idx], self.labels[idx], self.question_ids[idx]
+        batch_idx, local_idx, qid = self.index_map[idx]
+        batch_data = self._load_batch(batch_idx)
+        
+        return batch_data['graphs'][local_idx], batch_data['labels'][local_idx], qid
 
 
 class SequentialTraceDataset:
@@ -1274,14 +1326,15 @@ def run_ablation_experiments(args):
     
     if use_preprocessed:
         print(f"📦 Usando datos preprocesados desde: {args.preprocessed_dir}")
+        print(f"💾 Modo de carga: Lazy loading con cache de {args.max_cache_batches} batches")
         
         # Para LSTM: cargar desde lstm_solo/
         lstm_dir = Path(args.preprocessed_dir) / 'lstm_solo'
-        full_dataset_lstm = PreprocessedLSTMDataset(lstm_dir)
+        full_dataset_lstm = PreprocessedLSTMDataset(lstm_dir, max_cache_batches=args.max_cache_batches)
         
         # Para GNN: cargar desde gnn/
         gnn_dir = Path(args.preprocessed_dir) / 'gnn'
-        full_dataset_gnn = PreprocessedGNNDataset(gnn_dir)
+        full_dataset_gnn = PreprocessedGNNDataset(gnn_dir, max_cache_batches=args.max_cache_batches)
         
         # Split train/val/test (mismo split para ambos)
         total_size = len(full_dataset_lstm)
@@ -1618,6 +1671,8 @@ if __name__ == '__main__':
     # Datos
     parser.add_argument('--preprocessed-dir', type=str, default=None,
                        help='Directorio con datos preprocesados (si se especifica, se ignoran --data-pattern y --attn-threshold)')
+    parser.add_argument('--max-cache-batches', type=int, default=2,
+                       help='Número máximo de batches a mantener en cache de memoria (default: 2)')
     parser.add_argument('--data-pattern', type=str, default=None,
                        help='Patrón glob para archivos .pkl o .pkl.gz (ej: "traces_data/*.pkl*") [Solo si no se usa --preprocessed-dir]')
     parser.add_argument('--scores-file', type=str, default=None,
