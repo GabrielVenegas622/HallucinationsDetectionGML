@@ -74,8 +74,12 @@ def build_graph_from_trace(trace_data, layer_idx, attn_threshold=0.0):
     import numpy as np
     if isinstance(attention, np.ndarray):
         attention = torch.from_numpy(attention).half()  # float16
+    else:
+        attention = attention.half()
     if isinstance(hidden_states, np.ndarray):
         hidden_states = torch.from_numpy(hidden_states).half()  # float16
+    else:
+        hidden_states = hidden_states.half()
     
     # Promediar atención entre cabezas
     avg_attention = attention.mean(dim=0)  # [seq_len, seq_len]
@@ -85,17 +89,20 @@ def build_graph_from_trace(trace_data, layer_idx, attn_threshold=0.0):
     edge_attr = []
     
     seq_len = avg_attention.shape[0]
-    for i in range(seq_len):
-        for j in range(seq_len):
-            # IMPORTANTE: Solo permitir j <= i (causalidad: token i solo atiende al pasado)
-            if j <= i:
-                attn_value = avg_attention[i, j].item()
-                if attn_value > attn_threshold:
-                    # i presta atención a j: arco de j -> i
-                    edge_index.append([j, i])
-                    edge_attr.append(attn_value)
+    total_possible_edges = seq_len * (seq_len + 1) // 2  # Número máximo con causalidad
     
-    if len(edge_index) == 0:
+    for i in range(seq_len):
+        for j in range(i + 1):  # Solo j <= i (causalidad)
+            attn_value = avg_attention[i, j].item()
+            # Usar >= en lugar de > para ser consistente
+            if attn_value >= attn_threshold:
+                # i presta atención a j: arco de j -> i
+                edge_index.append([j, i])
+                edge_attr.append(attn_value)
+    
+    num_edges = len(edge_index)
+    
+    if num_edges == 0:
         # Grafo sin arcos
         edge_index = torch.zeros((2, 0), dtype=torch.long)
         edge_attr = torch.zeros((0,), dtype=torch.half)  # float16
@@ -110,6 +117,11 @@ def build_graph_from_trace(trace_data, layer_idx, attn_threshold=0.0):
         edge_attr=edge_attr,
         num_nodes=seq_len
     )
+    
+    # Agregar metadata para debugging
+    graph.num_possible_edges = total_possible_edges
+    graph.num_filtered_edges = num_edges
+    graph.filter_ratio = num_edges / total_possible_edges if total_possible_edges > 0 else 0.0
     
     return graph
 
@@ -132,6 +144,10 @@ def preprocess_batch(batch_file, labels_dict, args):
     labels = []
     question_ids = []
     
+    # Estadísticas de filtrado
+    total_possible_edges = 0
+    total_filtered_edges = 0
+    
     for trace in traces:
         question_id = trace['question_id']
         num_layers = len(trace['hidden_states'])
@@ -144,6 +160,8 @@ def preprocess_batch(batch_file, labels_dict, args):
             # Convertir a tensor si es numpy array (usar float16 para consistencia)
             if isinstance(last_token_hidden, np.ndarray):
                 last_token_hidden = torch.from_numpy(last_token_hidden).half()  # float16
+            else:
+                last_token_hidden = last_token_hidden.half()
             lstm_seq.append(last_token_hidden)
         lstm_seq = torch.stack(lstm_seq, dim=0)  # [num_layers, hidden_dim]
         lstm_sequences.append(lstm_seq)
@@ -153,6 +171,11 @@ def preprocess_batch(batch_file, labels_dict, args):
         for layer_idx in range(num_layers):
             graph = build_graph_from_trace(trace, layer_idx, args.attn_threshold)
             graphs_by_layer.append(graph)
+            
+            # Acumular estadísticas
+            total_possible_edges += graph.num_possible_edges
+            total_filtered_edges += graph.num_filtered_edges
+        
         gnn_graphs.append(graphs_by_layer)
         
         # Label
@@ -163,6 +186,9 @@ def preprocess_batch(batch_file, labels_dict, args):
     # Convertir LSTM sequences a tensor
     lstm_sequences = torch.stack(lstm_sequences, dim=0)  # [batch_size, num_layers, hidden_dim]
     labels_tensor = torch.tensor(labels, dtype=torch.float)
+    
+    # Calcular ratio de filtrado
+    filter_ratio = total_filtered_edges / total_possible_edges if total_possible_edges > 0 else 0.0
     
     return {
         'lstm_solo': {
@@ -175,7 +201,12 @@ def preprocess_batch(batch_file, labels_dict, args):
             'labels': labels_tensor,
             'question_ids': question_ids
         },
-        'batch_num': batch_num
+        'batch_num': batch_num,
+        'filter_stats': {
+            'total_possible_edges': total_possible_edges,
+            'total_filtered_edges': total_filtered_edges,
+            'filter_ratio': filter_ratio
+        }
     }
 
 
@@ -225,6 +256,10 @@ def preprocess_dataset(args):
     total_gnn_size = 0
     total_traces = 0
     
+    # Estadísticas globales de filtrado
+    global_possible_edges = 0
+    global_filtered_edges = 0
+    
     # 4. Procesar cada batch
     for batch_file in tqdm(batch_files, desc="Procesando batches"):
         try:
@@ -235,6 +270,10 @@ def preprocess_dataset(args):
                 batch_num = batch_files.index(batch_file)
             
             total_traces += len(processed['lstm_solo']['question_ids'])
+            
+            # Acumular estadísticas de filtrado
+            global_possible_edges += processed['filter_stats']['total_possible_edges']
+            global_filtered_edges += processed['filter_stats']['total_filtered_edges']
             
             # Guardar LSTM-solo
             lstm_output = lstm_dir / f'batch_{batch_num:04d}.pt'
@@ -252,21 +291,32 @@ def preprocess_dataset(args):
             
         except Exception as e:
             print(f"\n   ⚠️  Error procesando {batch_file}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
     
     # 5. Estadísticas finales
+    global_filter_ratio = global_filtered_edges / global_possible_edges if global_possible_edges > 0 else 0.0
+    
     print("\n" + "="*80)
     print("RESUMEN")
     print("="*80)
     print(f"Batches procesados: {len(batch_files)}")
     print(f"Traces totales: {total_traces}")
+    print(f"\nFiltrado de aristas (threshold={args.attn_threshold}):")
+    print(f"  Aristas posibles (con causalidad): {global_possible_edges:,}")
+    print(f"  Aristas filtradas (>=threshold): {global_filtered_edges:,}")
+    print(f"  Ratio de filtrado: {global_filter_ratio:.2%}")
+    print(f"  Aristas eliminadas: {global_possible_edges - global_filtered_edges:,} ({(1-global_filter_ratio):.2%})")
     print(f"\nArchivos generados:")
     print(f"  LSTM-solo:")
     print(f"    - Directorio: {lstm_dir}")
     print(f"    - Tamaño total: {total_lstm_size/(1024**2):.2f} MB")
+    print(f"    - Tamaño promedio por batch: {total_lstm_size/len(batch_files)/(1024**2):.2f} MB")
     print(f"  GNN-det+LSTM / GVAE:")
     print(f"    - Directorio: {gnn_dir}")
     print(f"    - Tamaño total: {total_gnn_size/(1024**2):.2f} MB")
+    print(f"    - Tamaño promedio por batch: {total_gnn_size/len(batch_files)/(1024**2):.2f} MB")
     print(f"\nNOTA: GNN-det+LSTM y GVAE comparten la misma estructura de grafos")
     print("="*80)
 
