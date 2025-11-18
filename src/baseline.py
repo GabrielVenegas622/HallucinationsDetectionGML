@@ -556,7 +556,7 @@ class PreprocessedGNNDataset:
         
         for batch_file in tqdm(batch_files, desc="Cargando batches"):
             batch_data = torch.load(batch_file, weights_only=False)
-            self.graphs_by_layer.append(batch_data['graphs_by_layer'])  # [N traces][num_layers]
+            self.graphs_by_layer.append(batch_data['graphs'])  # [N traces][num_layers]
             self.labels.append(batch_data['labels'])  # [N]
             self.question_ids.extend(batch_data['question_ids'])
         
