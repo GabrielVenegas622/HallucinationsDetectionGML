@@ -21,7 +21,7 @@ class TraceGraphDataset(TorchDataset):
     Si se cargan 100 traces y cada uno tiene 32 capas, este dataset
     reportará un tamaño de 3200 items.
     """
-    def __init__(self, pkl_files_pattern, attn_threshold=0.01, lazy_loading=True):
+    def __init__(self, pkl_files_pattern, attn_threshold=0.01, lazy_loading=True, max_files=None, max_traces_total=None):
         """
         Inicializa el dataset.
         
@@ -30,20 +30,23 @@ class TraceGraphDataset(TorchDataset):
                                       (e.g., "/path/to/traces_data/*.pkl").
             attn_threshold (float): Umbral para crear arcos de atención. [cite: 194]
             lazy_loading (bool): Si True, carga archivos bajo demanda. Si False, carga todo en memoria (legacy).
+            max_files (int, optional): Número máximo de archivos .pkl.gz a cargar. None = todos.
+            max_traces_total (int, optional): Número máximo TOTAL de traces a usar (a través de todos los archivos). None = todos.
         """
         
         self.attn_threshold = attn_threshold
         self.lazy_loading = lazy_loading
+        self.max_traces_total = max_traces_total
         
         print("Buscando archivos pkl/pkl.gz...")
         # Buscar tanto .pkl como .pkl.gz
         file_paths = glob.glob(pkl_files_pattern)
         # Si el patrón no incluye .gz, buscar también archivos comprimidos
-        if not pkl_files_pattern.endswith('.gz'):
+        if not pkl_files_pattern.endswith('.gz') and not pkl_files_pattern.endswith('*'):
             file_paths.extend(glob.glob(pkl_files_pattern.replace('.pkl', '.pkl.gz')))
         
-        # Filtrar archivos parciales (.part)
-        file_paths = [f for f in file_paths if not f.endswith('.part')]
+        # Eliminar duplicados y filtrar archivos parciales (.part)
+        file_paths = list(set([f for f in file_paths if not f.endswith('.part')]))
         
         print(f"Encontrados {len(file_paths)} archivos.")
         
@@ -57,14 +60,27 @@ class TraceGraphDataset(TorchDataset):
         if self.lazy_loading:
             # MODO LAZY: Solo guardar paths y crear índice sin cargar datos
             self.file_paths = sorted(file_paths)
+            
+            # Limitar número de archivos si se especifica
+            if max_files is not None and max_files < len(self.file_paths):
+                print(f"⚠️  Limitando a {max_files} archivos (de {len(self.file_paths)} totales)")
+                self.file_paths = self.file_paths[:max_files]
+            
             self.file_index_map = []  # (file_idx, trace_in_file_idx, layer_idx)
             self._file_cache = {}  # Cache LRU simple
             self._cache_max_size = 6  # Aumentado de 2 a 6 para mejor rendimiento
             self._cache_order = []  # Para implementar LRU
             
             # Leer el primer archivo para detectar num_layers y contar traces por archivo
-            print("Escaneando estructura de archivos...")
+            print(f"Escaneando estructura de {len(self.file_paths)} archivos...")
+            traces_indexed = 0  # Contador global de traces indexados
+            
             for file_idx, file_path in enumerate(tqdm(self.file_paths, desc="Indexando")):
+                # Si ya alcanzamos el límite total, no indexar más archivos
+                if self.max_traces_total is not None and traces_indexed >= self.max_traces_total:
+                    print(f"⚠️  Alcanzado límite de {self.max_traces_total} traces, saltando archivos restantes")
+                    break
+                
                 if file_path.endswith('.gz'):
                     with gzip.open(file_path, 'rb') as f:
                         batch_data = pickle.load(f)
@@ -75,10 +91,24 @@ class TraceGraphDataset(TorchDataset):
                 if file_idx == 0:
                     self.num_layers = len(batch_data[0]['hidden_states'])
                 
-                # Crear índice para cada trace y capa en este archivo
-                for trace_idx in range(len(batch_data)):
+                # Determinar cuántos traces usar de este archivo
+                num_traces_in_file = len(batch_data)
+                
+                if self.max_traces_total is not None:
+                    # Calcular cuántos traces podemos tomar de este archivo
+                    traces_remaining = self.max_traces_total - traces_indexed
+                    num_traces_to_use = min(num_traces_in_file, traces_remaining)
+                    if file_idx == 0 and num_traces_to_use < num_traces_in_file:
+                        print(f"⚠️  Usando solo {self.max_traces_total} traces totales")
+                else:
+                    num_traces_to_use = num_traces_in_file
+                
+                # Crear índice solo para los traces seleccionados
+                for trace_idx in range(num_traces_to_use):
                     for layer_idx in range(self.num_layers):
                         self.file_index_map.append((file_idx, trace_idx, layer_idx))
+                
+                traces_indexed += num_traces_to_use
             
             print(f"Detectado {self.num_layers} capas por trace.")
             print(f"Total de grafos a generar (items): {len(self.file_index_map)}")

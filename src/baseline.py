@@ -506,11 +506,17 @@ class SequentialTraceDataset:
     - label = 1 si score < threshold (alucinación)
     - label = 0 si score >= threshold (no alucinación)
     """
-    def __init__(self, pkl_files_pattern, scores_file, attn_threshold=0.01, score_threshold=0.5, lazy_loading=True):
+    def __init__(self, pkl_files_pattern, scores_file, attn_threshold=0.01, score_threshold=0.5, lazy_loading=True, max_files=None, max_traces_total=None):
         from dataloader import TraceGraphDataset
         
-        # Cargar dataset de grafos CON LAZY LOADING
-        self.graph_dataset = TraceGraphDataset(pkl_files_pattern, attn_threshold, lazy_loading=lazy_loading)
+        # Cargar dataset de grafos CON LAZY LOADING y límite de archivos/traces
+        self.graph_dataset = TraceGraphDataset(
+            pkl_files_pattern, 
+            attn_threshold, 
+            lazy_loading=lazy_loading,
+            max_files=max_files,
+            max_traces_total=max_traces_total
+        )
         
         # Cargar scores y convertir a etiquetas binarias
         scores_df = pd.read_csv(scores_file)
@@ -1044,19 +1050,20 @@ def run_ablation_experiments(args):
     
     # Crear dataset
     print("\nCargando dataset...")
+    
+    # Si se especifica max_traces, limitamos el número total de traces
+    max_traces_total = args.max_traces if args.max_traces is not None else None
+    
+    if max_traces_total is not None:
+        print(f"⚠️  Limitando a {max_traces_total} traces totales")
+    
     full_dataset = SequentialTraceDataset(
         args.data_pattern,
         args.scores_file,
         attn_threshold=args.attn_threshold,
-        score_threshold=args.score_threshold
+        score_threshold=args.score_threshold,
+        max_traces_total=max_traces_total
     )
-    
-    # Limitar número de traces si se especifica
-    if args.max_traces is not None and args.max_traces < len(full_dataset):
-        print(f"\n⚠️  Limitando dataset a {args.max_traces} traces (de {len(full_dataset)} totales)")
-        from torch.utils.data import Subset
-        indices = list(range(args.max_traces))
-        full_dataset = Subset(full_dataset, indices)
     
     # Split train/val/test
     total_size = len(full_dataset)
