@@ -516,7 +516,7 @@ class PreprocessedLSTMDataset:
         self.question_ids = []
         
         for batch_file in tqdm(batch_files, desc="Cargando batches"):
-            batch_data = torch.load(batch_file)
+            batch_data = torch.load(batch_file, weights_only=False)
             self.sequences.append(batch_data['sequences'])  # [N, num_layers, hidden_dim]
             self.labels.append(batch_data['labels'])  # [N]
             self.question_ids.extend(batch_data['question_ids'])
@@ -555,7 +555,7 @@ class PreprocessedGNNDataset:
         self.question_ids = []
         
         for batch_file in tqdm(batch_files, desc="Cargando batches"):
-            batch_data = torch.load(batch_file)
+            batch_data = torch.load(batch_file, weights_only=False)
             self.graphs_by_layer.append(batch_data['graphs_by_layer'])  # [N traces][num_layers]
             self.labels.append(batch_data['labels'])  # [N]
             self.question_ids.extend(batch_data['question_ids'])
