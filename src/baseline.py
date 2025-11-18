@@ -928,6 +928,10 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
     """
     Entrena el modelo LSTM Baseline con clasificación binaria.
     OPTIMIZADO PARA MEMORIA: Libera memoria GPU/RAM regularmente.
+    
+    Compatible con:
+    - Datos preprocesados (collate_lstm_batch): recibe tensores directamente
+    - Datos raw (collate_sequential_batch): recibe grafos PyG
     """
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -940,65 +944,16 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
         # Training
         model.train()
         train_loss = 0
-        for batched_by_layer, labels, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+        for batch_data in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            batched_by_layer, labels, _ = batch_data
             labels = labels.to(device, non_blocking=True).unsqueeze(1)
             
-            # OPTIMIZACIÓN: Transferir todas las capas a GPU de una vez
-            batched_by_layer_gpu = []
-            for layer_data in batched_by_layer:
-                layer_data_gpu = layer_data.to(device, non_blocking=True)
-                batched_by_layer_gpu.append(layer_data_gpu)
-            
-            # Extraer secuencia: SOLO ÚLTIMO TOKEN (sin información estructural)
-            # Esto es clave para LSTM-solo: comparar el último token a través de capas
-            layer_sequence = []
-            for layer_data in batched_by_layer_gpu:
-                # Extraer hidden states del último token de cada grafo en el batch
-                batch_size = layer_data.batch.max().item() + 1
-                last_token_features = []
-                
-                for batch_idx in range(batch_size):
-                    # Obtener nodos de este grafo en el batch
-                    node_mask = (layer_data.batch == batch_idx)
-                    graph_nodes = layer_data.x[node_mask]
-                    
-                    # Tomar el ÚLTIMO nodo (último token)
-                    last_token = graph_nodes[-1]  # [hidden_dim]
-                    last_token_features.append(last_token)
-                
-                # Stack para crear batch
-                layer_repr = torch.stack(last_token_features, dim=0)  # [batch, hidden_dim]
-                layer_sequence.append(layer_repr)
-            
-            layer_sequence = torch.stack(layer_sequence, dim=1)  # [batch, layers, dim]
-            
-            optimizer.zero_grad()
-            logits = model(layer_sequence)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item()
-            
-            # Liberar memoria
-            del layer_sequence, logits, loss, labels, batched_by_layer_gpu
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        
-        # Liberar memoria después del training
-        gc.collect()
-        
-        # Validation
-        model.eval()
-        val_loss = 0
-        all_probs = []
-        all_labels = []
-        all_preds = []
-        
-        with torch.no_grad():
-            for batched_by_layer, labels, _ in val_loader:
-                labels = labels.to(device, non_blocking=True).unsqueeze(1)
-                
+            # Detectar si son datos preprocesados (tensores) o raw (grafos PyG)
+            if isinstance(batched_by_layer, torch.Tensor):
+                # Datos preprocesados: ya tenemos las secuencias listas
+                layer_sequence = batched_by_layer.to(device, non_blocking=True)
+            else:
+                # Datos raw: extraer secuencia de grafos
                 # OPTIMIZACIÓN: Transferir todas las capas a GPU de una vez
                 batched_by_layer_gpu = []
                 for layer_data in batched_by_layer:
@@ -1006,6 +961,7 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
                     batched_by_layer_gpu.append(layer_data_gpu)
                 
                 # Extraer secuencia: SOLO ÚLTIMO TOKEN (sin información estructural)
+                # Esto es clave para LSTM-solo: comparar el último token a través de capas
                 layer_sequence = []
                 for layer_data in batched_by_layer_gpu:
                     # Extraer hidden states del último token de cada grafo en el batch
@@ -1025,9 +981,73 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
                     layer_repr = torch.stack(last_token_features, dim=0)  # [batch, hidden_dim]
                     layer_sequence.append(layer_repr)
                 
-                layer_sequence = torch.stack(layer_sequence, dim=1)
-                logits = model(layer_sequence)
+                layer_sequence = torch.stack(layer_sequence, dim=1)  # [batch, layers, dim]
+            
+            optimizer.zero_grad()
+            logits = model(layer_sequence)
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            
+            # Liberar memoria
+            del layer_sequence, logits, loss, labels
+            if not isinstance(batched_by_layer, torch.Tensor):
+                del batched_by_layer_gpu
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # Liberar memoria después del training
+        gc.collect()
+        
+        # Validation
+        model.eval()
+        val_loss = 0
+        all_probs = []
+        all_labels = []
+        all_preds = []
+        
+        with torch.no_grad():
+            for batch_data in val_loader:
+                batched_by_layer, labels, _ = batch_data
+                labels = labels.to(device, non_blocking=True).unsqueeze(1)
                 
+                # Detectar si son datos preprocesados (tensores) o raw (grafos PyG)
+                if isinstance(batched_by_layer, torch.Tensor):
+                    # Datos preprocesados: ya tenemos las secuencias listas
+                    layer_sequence = batched_by_layer.to(device, non_blocking=True)
+                else:
+                    # Datos raw: extraer secuencia de grafos
+                    # OPTIMIZACIÓN: Transferir todas las capas a GPU de una vez
+                    batched_by_layer_gpu = []
+                    for layer_data in batched_by_layer:
+                        layer_data_gpu = layer_data.to(device, non_blocking=True)
+                        batched_by_layer_gpu.append(layer_data_gpu)
+                    
+                    # Extraer secuencia: SOLO ÚLTIMO TOKEN (sin información estructural)
+                    layer_sequence = []
+                    for layer_data in batched_by_layer_gpu:
+                        # Extraer hidden states del último token de cada grafo en el batch
+                        batch_size = layer_data.batch.max().item() + 1
+                        last_token_features = []
+                        
+                        for batch_idx in range(batch_size):
+                            # Obtener nodos de este grafo en el batch
+                            node_mask = (layer_data.batch == batch_idx)
+                            graph_nodes = layer_data.x[node_mask]
+                            
+                            # Tomar el ÚLTIMO nodo (último token)
+                            last_token = graph_nodes[-1]  # [hidden_dim]
+                            last_token_features.append(last_token)
+                        
+                        # Stack para crear batch
+                        layer_repr = torch.stack(last_token_features, dim=0)  # [batch, hidden_dim]
+                        layer_sequence.append(layer_repr)
+                    
+                    layer_sequence = torch.stack(layer_sequence, dim=1)
+                
+                logits = model(layer_sequence)
                 loss = criterion(logits, labels)
                 val_loss += loss.item()
                 
@@ -1040,7 +1060,9 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
                 all_preds.extend(preds.cpu().numpy().flatten())
                 
                 # Liberar memoria
-                del layer_sequence, logits, loss, probs, preds, labels, batched_by_layer_gpu
+                del layer_sequence, logits, loss, probs, preds, labels
+                if not isinstance(batched_by_layer, torch.Tensor):
+                    del batched_by_layer_gpu
         
         # Liberar memoria después de validation
         if torch.cuda.is_available():
