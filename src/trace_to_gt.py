@@ -180,16 +180,17 @@ def load_ground_truth_dataset(dataset_name):
     return ground_truth
 
 
-def load_traces_from_pkl(traces_dir, dataset_name):
+def load_traces_from_pkl_lazy(traces_dir, dataset_name):
     """
-    Carga todos los traces desde archivos .pkl o .pkl.gz en el directorio.
+    Generador que carga traces desde archivos .pkl o .pkl.gz de forma lazy,
+    manteniendo máximo 3 archivos en memoria simultáneamente.
     
     Args:
         traces_dir: Path al directorio con archivos .pkl o .pkl.gz
         dataset_name: Nombre del dataset para filtrar archivos
         
-    Returns:
-        dict: Mapeo de question_id -> trace_data
+    Yields:
+        dict: trace_data individual
     """
     traces_dir = Path(traces_dir)
     
@@ -200,20 +201,20 @@ def load_traces_from_pkl(traces_dir, dataset_name):
     pkl_files = list(traces_dir.glob(pkl_pattern))
     pkl_gz_files = list(traces_dir.glob(pkl_gz_pattern))
     
-    # Combinar ambas listas
+    # Combinar y ordenar
     all_files = sorted(pkl_files + pkl_gz_files)
     
     if not all_files:
         print(f"⚠️  No se encontraron archivos .pkl o .pkl.gz para {dataset_name} en {traces_dir}")
         print(f"   Patrones de búsqueda: {pkl_pattern}, {pkl_gz_pattern}")
-        return {}
+        return
     
-    print(f"\nCargando traces desde {len(all_files)} archivos (.pkl y .pkl.gz)...")
+    print(f"\nCargando traces desde {len(all_files)} archivos (.pkl y .pkl.gz) - MODO LAZY...")
+    print(f"  Máximo 3 archivos en memoria simultáneamente")
     
-    traces_dict = {}
-    
-    for file_path in tqdm(all_files, desc="Cargando archivos"):
-        # Determinar si es comprimido o no
+    # Procesar archivos de forma lazy
+    for file_path in tqdm(all_files, desc="Procesando archivos"):
+        # Cargar archivo
         if file_path.suffix == '.gz':
             with gzip.open(file_path, 'rb') as f:
                 batch_traces = pickle.load(f)
@@ -221,17 +222,20 @@ def load_traces_from_pkl(traces_dir, dataset_name):
             with open(file_path, 'rb') as f:
                 batch_traces = pickle.load(f)
         
+        # Yield cada trace individualmente
         for trace in batch_traces:
-            question_id = trace['question_id']
-            traces_dict[question_id] = trace
-    
-    print(f"✅ Cargados {len(traces_dict)} traces únicos")
-    return traces_dict
+            yield trace
+        
+        # Liberar memoria después de procesar cada archivo
+        del batch_traces
+        import gc
+        gc.collect()
 
 
 def generate_ground_truth_scores(args):
     """
     Función principal que genera el archivo con scores BLEURT.
+    OPTIMIZADO PARA MEMORIA: Usa lazy loading y procesa traces incrementalmente.
     
     Args:
         args: Argumentos de línea de comandos
@@ -247,23 +251,22 @@ def generate_ground_truth_scores(args):
     # 2. Cargar ground truth del dataset original
     ground_truth = load_ground_truth_dataset(args.dataset)
     
-    # 3. Cargar traces generados
-    traces = load_traces_from_pkl(args.traces_dir, args.dataset)
-    
-    if not traces:
-        print("❌ No se encontraron traces para procesar")
-        return
-    
-    # 4. Calcular scores BLEURT
+    # 3. Procesar traces usando lazy loading (streaming)
     print("\n" + "="*80)
-    print("CALCULANDO SCORES BLEURT (MAX sobre todas las referencias)")
+    print("CALCULANDO SCORES BLEURT (MAX sobre todas las referencias) - MODO LAZY")
     print("="*80)
     
     results = []
     missing_ground_truth = 0
     total_comparisons = 0
     
-    for question_id, trace in tqdm(traces.items(), desc="Procesando traces"):
+    # Usar generador lazy en lugar de cargar todo en memoria
+    trace_generator = load_traces_from_pkl_lazy(args.traces_dir, args.dataset)
+    
+    # Procesar traces uno a uno
+    for trace in trace_generator:
+        question_id = trace['question_id']
+        
         # Obtener respuesta generada
         generated_answer = trace.get('generated_answer_clean', '')
         
@@ -296,8 +299,16 @@ def generate_ground_truth_scores(args):
             'min_score': min(all_scores) if all_scores else 0.0,
             'avg_score': sum(all_scores) / len(all_scores) if all_scores else 0.0
         })
+        
+        # Liberar memoria periódicamente cada 100 traces
+        if len(results) % 100 == 0:
+            import gc
+            gc.collect()
+            print(f"\n  ➜ Procesados {len(results)} traces, liberando memoria...")
     
-    # 5. Crear DataFrame y guardar resultados
+    print(f"\n✅ Procesamiento completado: {len(results)} traces")
+    
+    # 4. Crear DataFrame y guardar resultados
     df = pd.DataFrame(results)
     
     # Ordenar por question_id
