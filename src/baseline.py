@@ -503,10 +503,10 @@ class PreprocessedLSTMDataset:
     def __init__(self, preprocessed_dir):
         self.preprocessed_dir = Path(preprocessed_dir)
         
-        # Buscar archivos de batches
-        batch_files = sorted(list(self.preprocessed_dir.glob('batch_*.pt')))
+        # Buscar archivos de batches (patrón: preprocessed_*.pt)
+        batch_files = sorted(list(self.preprocessed_dir.glob('preprocessed_*.pt')))
         if not batch_files:
-            raise ValueError(f"No se encontraron archivos batch_*.pt en {preprocessed_dir}")
+            raise ValueError(f"No se encontraron archivos preprocessed_*.pt en {preprocessed_dir}")
         
         print(f"Cargando {len(batch_files)} batches preprocesados desde {preprocessed_dir}...")
         
@@ -542,10 +542,10 @@ class PreprocessedGNNDataset:
     def __init__(self, preprocessed_dir):
         self.preprocessed_dir = Path(preprocessed_dir)
         
-        # Buscar archivos de batches
-        batch_files = sorted(list(self.preprocessed_dir.glob('batch_*.pt')))
+        # Buscar archivos de batches (patrón: preprocessed_*.pt)
+        batch_files = sorted(list(self.preprocessed_dir.glob('preprocessed_*.pt')))
         if not batch_files:
-            raise ValueError(f"No se encontraron archivos batch_*.pt en {preprocessed_dir}")
+            raise ValueError(f"No se encontraron archivos preprocessed_*.pt en {preprocessed_dir}")
         
         print(f"Cargando {len(batch_files)} batches preprocesados desde {preprocessed_dir}...")
         

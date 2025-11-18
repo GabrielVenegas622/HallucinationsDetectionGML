@@ -47,6 +47,25 @@ def extract_batch_number(filename):
     return None
 
 
+def get_preprocessed_filename(original_path):
+    """
+    Genera el nombre del archivo preprocesado basado en el original.
+    Ejemplo: traces_data/batch_0001.pkl.gz -> preprocessed_batch_0001.pt
+    """
+    original_path = Path(original_path)
+    
+    # Obtener el nombre sin extensiones
+    name = original_path.name
+    # Remover .pkl.gz, .pkl, etc.
+    if name.endswith('.pkl.gz'):
+        name = name[:-7]
+    elif name.endswith('.pkl'):
+        name = name[:-4]
+    
+    # Agregar prefijo preprocessed_ y extensión .pt
+    return f'preprocessed_{name}.pt'
+
+
 def load_trace_file(file_path):
     """Carga un archivo .pkl o .pkl.gz"""
     if str(file_path).endswith('.gz'):
@@ -264,10 +283,9 @@ def preprocess_dataset(args):
     for batch_file in tqdm(batch_files, desc="Procesando batches"):
         try:
             processed = preprocess_batch(batch_file, labels_dict, args)
-            batch_num = processed['batch_num']
             
-            if batch_num is None:
-                batch_num = batch_files.index(batch_file)
+            # Generar nombre basado en el archivo original
+            preprocessed_name = get_preprocessed_filename(batch_file)
             
             total_traces += len(processed['lstm_solo']['question_ids'])
             
@@ -276,12 +294,12 @@ def preprocess_dataset(args):
             global_filtered_edges += processed['filter_stats']['total_filtered_edges']
             
             # Guardar LSTM-solo
-            lstm_output = lstm_dir / f'batch_{batch_num:04d}.pt'
+            lstm_output = lstm_dir / preprocessed_name
             torch.save(processed['lstm_solo'], lstm_output)
             total_lstm_size += lstm_output.stat().st_size
             
             # Guardar GNN (para GNN-det+LSTM y GVAE)
-            gnn_output = gnn_dir / f'batch_{batch_num:04d}.pt'
+            gnn_output = gnn_dir / preprocessed_name
             torch.save(processed['gnn'], gnn_output)
             total_gnn_size += gnn_output.stat().st_size
             
