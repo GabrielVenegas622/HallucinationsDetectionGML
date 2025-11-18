@@ -5,3 +5,4 @@ ignore/
 traces_data/
 *.pkl
 .ipynb_checkpoints/
+preprocessed_data/
