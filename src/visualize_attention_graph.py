@@ -109,12 +109,15 @@ def create_attention_graph(trace, layer_idx, attn_threshold=0.01):
         v_label[G.vertex(i)] = token_text
     
     # 4. Agregar arcos basados en threshold de atención
+    # IMPORTANTE: Respetar causalidad - solo crear arcos i -> j donde j <= i
+    # attn_avg[i, j] = cuánta atención el token i presta al token j
+    # Por lo tanto, el arco debe ir: i -> j (el observador apunta a lo observado)
     edge_weights = []
     for i in range(num_nodes):
-        for j in range(num_nodes):
+        for j in range(i + 1):  # Solo j <= i (triangular inferior por causalidad)
             weight = attn_avg[i, j]
             if weight > attn_threshold:
-                e = G.add_edge(G.vertex(j), G.vertex(i))  # j -> i (source -> target)
+                e = G.add_edge(G.vertex(i), G.vertex(j))  # i -> j (observador -> observado)
                 e_weight[e] = weight
                 edge_weights.append(weight)
     

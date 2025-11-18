@@ -235,7 +235,16 @@ class TraceGraphDataset(TorchDataset):
             attn_avg = F.pad(attn_avg, (0, pad_size, 0, pad_size), value=0.0)
         
         # Aplicar umbral de forma eficiente
-        mask = attn_avg > self.attn_threshold
+        # IMPORTANTE: Respetar causalidad - solo considerar triangular inferior
+        # attn_avg[i,j] = cuánta atención el token i presta al token j
+        # El arco debe ir: i -> j (el observador apunta a lo observado)
+        # Por causalidad en modelos autoregresivos: solo puede haber arcos i->j si j <= i
+        
+        # Crear máscara causal (triangular inferior)
+        causal_mask = torch.tril(torch.ones(num_nodes, num_nodes, dtype=torch.bool))
+        
+        # Aplicar tanto umbral como máscara causal
+        mask = (attn_avg > self.attn_threshold) & causal_mask
         
         # Obtener edge_index de forma eficiente
         indices = mask.nonzero(as_tuple=False).t()
@@ -246,8 +255,9 @@ class TraceGraphDataset(TorchDataset):
             indices = indices[:, valid_mask]
             
             if indices.numel() > 0:
-                # Crear edge_index (j -> i según cita 195)
-                edge_index = torch.stack([indices[1], indices[0]], dim=0)
+                # Crear edge_index: i -> j donde attn_avg[i,j] > threshold
+                # indices[0] = i (observador), indices[1] = j (observado)
+                edge_index = torch.stack([indices[0], indices[1]], dim=0)
                 
                 # Obtener edge_attr
                 edge_attr = attn_avg[mask][valid_mask].unsqueeze(1)
