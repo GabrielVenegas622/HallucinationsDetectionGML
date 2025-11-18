@@ -19,7 +19,7 @@ METODOLOGÍA HaloScope:
 - AUROC como métrica principal de evaluación
 
 Uso:
-    python baseline.py --data-pattern "traces_data/*.pkl" --scores-file ground_truth_scores.csv --epochs 50 --score-threshold 0.5
+    python baseline.py --data-pattern "traces_data/*.pkl*" --scores-file ground_truth_scores.csv --epochs 50 --score-threshold 0.5
 """
 
 import torch
@@ -1213,7 +1213,7 @@ if __name__ == '__main__':
     
     # Datos
     parser.add_argument('--data-pattern', type=str, required=True,
-                       help='Patrón glob para archivos .pkl (ej: "traces_data/*.pkl")')
+                       help='Patrón glob para archivos .pkl o .pkl.gz (ej: "traces_data/*.pkl*")')
     parser.add_argument('--scores-file', type=str, required=True,
                        help='Archivo CSV con scores BLEURT')
     parser.add_argument('--attn-threshold', type=float, default=0.0,

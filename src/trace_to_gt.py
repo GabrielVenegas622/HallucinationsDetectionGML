@@ -2,7 +2,7 @@
 Script para generar ground truth con scores BLEURT para traces.
 
 Este script:
-1. Carga los traces generados por trace_extractor.py desde archivos .pkl
+1. Carga los traces generados por trace_extractor.py desde archivos .pkl o .pkl.gz
 2. Carga el dataset original (TriviaQA o TruthfulQA) para obtener respuestas correctas
 3. Calcula el score BLEURT entre la respuesta generada y la respuesta correcta
 4. Genera un archivo CSV con pares (question_id, bleurt_score)
@@ -13,6 +13,7 @@ Uso:
 """
 
 import pickle
+import gzip
 import argparse
 import pandas as pd
 import numpy as np
@@ -181,10 +182,10 @@ def load_ground_truth_dataset(dataset_name):
 
 def load_traces_from_pkl(traces_dir, dataset_name):
     """
-    Carga todos los traces desde archivos .pkl en el directorio.
+    Carga todos los traces desde archivos .pkl o .pkl.gz en el directorio.
     
     Args:
-        traces_dir: Path al directorio con archivos .pkl
+        traces_dir: Path al directorio con archivos .pkl o .pkl.gz
         dataset_name: Nombre del dataset para filtrar archivos
         
     Returns:
@@ -192,22 +193,33 @@ def load_traces_from_pkl(traces_dir, dataset_name):
     """
     traces_dir = Path(traces_dir)
     
-    # Buscar archivos .pkl que correspondan al dataset
+    # Buscar archivos .pkl y .pkl.gz que correspondan al dataset
     pkl_pattern = f"*{dataset_name}*.pkl"
-    pkl_files = sorted(traces_dir.glob(pkl_pattern))
+    pkl_gz_pattern = f"*{dataset_name}*.pkl.gz"
     
-    if not pkl_files:
-        print(f"⚠️  No se encontraron archivos .pkl para {dataset_name} en {traces_dir}")
-        print(f"   Patrón de búsqueda: {pkl_pattern}")
+    pkl_files = list(traces_dir.glob(pkl_pattern))
+    pkl_gz_files = list(traces_dir.glob(pkl_gz_pattern))
+    
+    # Combinar ambas listas
+    all_files = sorted(pkl_files + pkl_gz_files)
+    
+    if not all_files:
+        print(f"⚠️  No se encontraron archivos .pkl o .pkl.gz para {dataset_name} en {traces_dir}")
+        print(f"   Patrones de búsqueda: {pkl_pattern}, {pkl_gz_pattern}")
         return {}
     
-    print(f"\nCargando traces desde {len(pkl_files)} archivos .pkl...")
+    print(f"\nCargando traces desde {len(all_files)} archivos (.pkl y .pkl.gz)...")
     
     traces_dict = {}
     
-    for pkl_file in tqdm(pkl_files, desc="Cargando archivos"):
-        with open(pkl_file, 'rb') as f:
-            batch_traces = pickle.load(f)
+    for file_path in tqdm(all_files, desc="Cargando archivos"):
+        # Determinar si es comprimido o no
+        if file_path.suffix == '.gz':
+            with gzip.open(file_path, 'rb') as f:
+                batch_traces = pickle.load(f)
+        else:
+            with open(file_path, 'rb') as f:
+                batch_traces = pickle.load(f)
         
         for trace in batch_traces:
             question_id = trace['question_id']
@@ -380,7 +392,7 @@ if __name__ == '__main__':
         '--traces-dir',
         type=str,
         default='./traces_data',
-        help='Directorio con archivos .pkl de traces (default: ./traces_data)'
+        help='Directorio con archivos .pkl o .pkl.gz de traces (default: ./traces_data)'
     )
     
     parser.add_argument(
