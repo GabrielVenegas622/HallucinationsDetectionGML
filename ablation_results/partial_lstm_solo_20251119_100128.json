@@ -1,0 +1,50 @@
+{
+  "model": "LSTM-solo",
+  "metrics": {
+    "best_val_auroc": 0.8523809523809525,
+    "best_val_acc": 0.7567567567567568,
+    "best_val_f1": 0.8235294117647058,
+    "test_auroc": 0.7169230769230769,
+    "test_acc": 0.7105263157894737,
+    "test_f1": 0.7555555555555555,
+    "best_threshold": 0.6374371647834778,
+    "history": {
+      "train_loss": [
+        0.6870363354682922
+      ],
+      "val_loss": [
+        0.5639751076698303
+      ],
+      "val_auroc": [
+        0.8523809523809525
+      ],
+      "val_acc": [
+        0.7567567567567568
+      ],
+      "val_f1": [
+        0.8235294117647058
+      ],
+      "test_auroc": 0.7169230769230769,
+      "test_acc": 0.7105263157894737,
+      "test_f1": 0.7555555555555555,
+      "test_precision": 0.85,
+      "test_recall": 0.68,
+      "best_threshold": 0.6374371647834778
+    }
+  },
+  "config": {
+    "score_threshold": 0.5,
+    "attn_threshold": 0.0,
+    "epochs": 1,
+    "batch_size": 8,
+    "lr": 0.001,
+    "gnn_hidden": 128,
+    "latent_dim": 128,
+    "lstm_hidden": 128,
+    "num_lstm_layers": 2,
+    "dropout": 0.3,
+    "kl_weight": 0.01,
+    "max_cache_batches": 2
+  },
+  "timestamp": "20251119_100128"
+}

@@ -1,0 +1,50 @@
+{
+  "model": "GNN-det+LSTM",
+  "metrics": {
+    "best_val_auroc": 0.8952380952380953,
+    "best_val_acc": 0.8918918918918919,
+    "best_val_f1": 0.9310344827586207,
+    "test_auroc": 0.7292307692307692,
+    "test_acc": 0.6578947368421053,
+    "test_f1": 0.7450980392156863,
+    "best_threshold": 0.6014508605003357,
+    "history": {
+      "train_loss": [
+        0.6773819137703289
+      ],
+      "val_loss": [
+        0.5925236582756043
+      ],
+      "val_auroc": [
+        0.8952380952380953
+      ],
+      "val_acc": [
+        0.8918918918918919
+      ],
+      "val_f1": [
+        0.9310344827586207
+      ],
+      "test_auroc": 0.7292307692307692,
+      "test_acc": 0.6578947368421053,
+      "test_f1": 0.7450980392156863,
+      "test_precision": 0.7307692307692307,
+      "test_recall": 0.76,
+      "best_threshold": 0.6014508605003357
+    }
+  },
+  "config": {
+    "score_threshold": 0.5,
+    "attn_threshold": 0.0,
+    "epochs": 1,
+    "batch_size": 8,
+    "lr": 0.001,
+    "gnn_hidden": 128,
+    "latent_dim": 128,
+    "lstm_hidden": 128,
+    "num_lstm_layers": 2,
+    "dropout": 0.3,
+    "kl_weight": 0.01,
+    "max_cache_batches": 2
+  },
+  "timestamp": "20251119_100128"
+}

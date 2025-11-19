@@ -978,14 +978,20 @@ def evaluate_model(model, data_loader, device, threshold=0.5, is_gvae=False):
                 # Datos raw (grafos) - convertir a float32 para evitar dtype mismatch
                 batched_by_layer_gpu = []
                 for layer_data in batched_by_layer:
-                    batched_by_layer_gpu.append(layer_data.to(device, dtype=torch.float32, non_blocking=True))
+                    layer_data = layer_data.to(device, non_blocking=True)
+                    # Convertir atributos a float32 si son half
+                    if layer_data.x.dtype == torch.float16:
+                        layer_data.x = layer_data.x.to(torch.float32)
+                    if hasattr(layer_data, 'edge_attr') and layer_data.edge_attr is not None and layer_data.edge_attr.dtype == torch.float16:
+                        layer_data.edge_attr = layer_data.edge_attr.to(torch.float32)
+                    batched_by_layer_gpu.append(layer_data)
                 
                 if is_gvae:
                     # GVAE devuelve múltiples salidas
                     logits, _, _, _, _ = model(batched_by_layer_gpu, len(batched_by_layer_gpu))
                 else:
                     # GNN-det o LSTM desde grafos
-                    logits = model(batched_by_layer_gpu)
+                    logits = model(batched_by_layer_gpu, len(batched_by_layer_gpu))
             
             probs = torch.sigmoid(logits)
             all_probs.extend(probs.cpu().numpy().flatten())
@@ -1169,7 +1175,7 @@ def train_lstm_baseline(model, train_loader, val_loader, test_loader, device, ep
         # Encontrar threshold óptimo en validación
         all_probs = np.array(all_probs)
         all_labels = np.array(all_labels)
-        optimal_threshold, optimal_f1 = find_optimal_threshold(all_labels, all_probs)
+        optimal_threshold, _ = find_optimal_threshold(all_labels, all_probs)
         
         # Recalcular predicciones con threshold óptimo
         all_preds_optimal = (all_probs > optimal_threshold).astype(float)
@@ -1199,7 +1205,7 @@ def train_lstm_baseline(model, train_loader, val_loader, test_loader, device, ep
     print("\n" + "="*80)
     print("EVALUACIÓN EN CONJUNTO DE TEST")
     print("="*80)
-    model.load_state_dict(torch.load('best_lstm_baseline.pt'))
+    model.load_state_dict(torch.load('best_lstm_baseline.pt', weights_only=False))
     test_metrics = evaluate_model(model, test_loader, device, threshold=best_threshold, is_gvae=False)
     
     print(f"\nMétricas en TEST (threshold={best_threshold:.3f}):")
@@ -1240,10 +1246,18 @@ def train_gnn_det_lstm(model, train_loader, val_loader, test_loader, device, epo
             labels = labels.to(device).unsqueeze(1)
             
             # Mover datos a device y convertir a float32 si es necesario
-            batched_by_layer = [data.to(device, dtype=torch.float32) for data in batched_by_layer]
+            batched_by_layer_gpu = []
+            for data in batched_by_layer:
+                data = data.to(device)
+                # Convertir atributos a float32 si son half
+                if data.x.dtype == torch.float16:
+                    data.x = data.x.to(torch.float32)
+                if hasattr(data, 'edge_attr') and data.edge_attr is not None and data.edge_attr.dtype == torch.float16:
+                    data.edge_attr = data.edge_attr.to(torch.float32)
+                batched_by_layer_gpu.append(data)
             
             optimizer.zero_grad()
-            logits = model(batched_by_layer, len(batched_by_layer))
+            logits = model(batched_by_layer_gpu, len(batched_by_layer_gpu))
             loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
@@ -1268,9 +1282,17 @@ def train_gnn_det_lstm(model, train_loader, val_loader, test_loader, device, epo
             for batched_by_layer, labels, _ in val_loader:
                 labels = labels.to(device).unsqueeze(1)
                 # Convertir a float32 para evitar dtype mismatch
-                batched_by_layer = [data.to(device, dtype=torch.float32) for data in batched_by_layer]
+                batched_by_layer_gpu = []
+                for data in batched_by_layer:
+                    data = data.to(device)
+                    # Convertir atributos a float32 si son half
+                    if data.x.dtype == torch.float16:
+                        data.x = data.x.to(torch.float32)
+                    if hasattr(data, 'edge_attr') and data.edge_attr is not None and data.edge_attr.dtype == torch.float16:
+                        data.edge_attr = data.edge_attr.to(torch.float32)
+                    batched_by_layer_gpu.append(data)
                 
-                logits = model(batched_by_layer, len(batched_by_layer))
+                logits = model(batched_by_layer_gpu, len(batched_by_layer_gpu))
                 loss = criterion(logits, labels)
                 val_loss += loss.item()
                 
@@ -1296,7 +1318,7 @@ def train_gnn_det_lstm(model, train_loader, val_loader, test_loader, device, epo
         # Encontrar threshold óptimo en validación (Youden's J para AUROC)
         all_probs = np.array(all_probs)
         all_labels = np.array(all_labels)
-        optimal_threshold, optimal_f1 = find_optimal_threshold(all_labels, all_probs)
+        optimal_threshold, _ = find_optimal_threshold(all_labels, all_probs)
         
         # Recalcular predicciones con threshold óptimo
         all_preds_optimal = (all_probs > optimal_threshold).astype(float)
@@ -1324,7 +1346,7 @@ def train_gnn_det_lstm(model, train_loader, val_loader, test_loader, device, epo
     print("\n" + "="*80)
     print("EVALUACIÓN EN CONJUNTO DE TEST")
     print("="*80)
-    model.load_state_dict(torch.load('best_gnn_det_lstm.pt'))
+    model.load_state_dict(torch.load('best_gnn_det_lstm.pt', weights_only=False))
     test_metrics = evaluate_model(model, test_loader, device, threshold=best_threshold, is_gvae=False)
     
     print(f"\nMétricas en TEST (threshold={best_threshold:.3f}):")
@@ -1368,11 +1390,19 @@ def train_gvae_lstm(model, train_loader, val_loader, test_loader, device, epochs
         for batched_by_layer, labels, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
             labels = labels.to(device).unsqueeze(1)
             # Convertir a float32 para evitar dtype mismatch
-            batched_by_layer = [data.to(device, dtype=torch.float32) for data in batched_by_layer]
+            batched_by_layer_gpu = []
+            for data in batched_by_layer:
+                data = data.to(device)
+                # Convertir atributos a float32 si son half
+                if data.x.dtype == torch.float16:
+                    data.x = data.x.to(torch.float32)
+                if hasattr(data, 'edge_attr') and data.edge_attr is not None and data.edge_attr.dtype == torch.float16:
+                    data.edge_attr = data.edge_attr.to(torch.float32)
+                batched_by_layer_gpu.append(data)
             
             optimizer.zero_grad()
             logits, mu_list, logvar_list, orig_list, recon_list = model(
-                batched_by_layer, len(batched_by_layer)
+                batched_by_layer_gpu, len(batched_by_layer_gpu)
             )
             
             # Pérdida de la tarea principal (clasificación binaria)
@@ -1412,9 +1442,17 @@ def train_gvae_lstm(model, train_loader, val_loader, test_loader, device, epochs
             for batched_by_layer, labels, _ in val_loader:
                 labels = labels.to(device).unsqueeze(1)
                 # Convertir a float32 para evitar dtype mismatch
-                batched_by_layer = [data.to(device, dtype=torch.float32) for data in batched_by_layer]
+                batched_by_layer_gpu = []
+                for data in batched_by_layer:
+                    data = data.to(device)
+                    # Convertir atributos a float32 si son half
+                    if data.x.dtype == torch.float16:
+                        data.x = data.x.to(torch.float32)
+                    if hasattr(data, 'edge_attr') and data.edge_attr is not None and data.edge_attr.dtype == torch.float16:
+                        data.edge_attr = data.edge_attr.to(torch.float32)
+                    batched_by_layer_gpu.append(data)
                 
-                logits, _, _, _, _ = model(batched_by_layer, len(batched_by_layer))
+                logits, _, _, _, _ = model(batched_by_layer_gpu, len(batched_by_layer_gpu))
                 loss = criterion(logits, labels)
                 val_loss += loss.item()
                 
@@ -1442,7 +1480,7 @@ def train_gvae_lstm(model, train_loader, val_loader, test_loader, device, epochs
         # Encontrar threshold óptimo en validación (Youden's J para AUROC)
         all_probs = np.array(all_probs)
         all_labels = np.array(all_labels)
-        optimal_threshold, optimal_f1 = find_optimal_threshold(all_labels, all_probs)
+        optimal_threshold, _ = find_optimal_threshold(all_labels, all_probs)
         
         # Recalcular predicciones con threshold óptimo
         all_preds_optimal = (all_probs > optimal_threshold).astype(float)
@@ -1472,7 +1510,7 @@ def train_gvae_lstm(model, train_loader, val_loader, test_loader, device, epochs
     print("\n" + "="*80)
     print("EVALUACIÓN EN CONJUNTO DE TEST")
     print("="*80)
-    model.load_state_dict(torch.load('best_gvae_lstm.pt'))
+    model.load_state_dict(torch.load('best_gvae_lstm.pt', weights_only=False))
     test_metrics = evaluate_model(model, test_loader, device, threshold=best_threshold, is_gvae=True)
     
     print(f"\nMétricas en TEST (threshold={best_threshold:.3f}):")
@@ -2058,7 +2096,7 @@ if __name__ == '__main__':
     # Arquitectura
     parser.add_argument('--gnn-hidden', type=int, default=128,
                        help='Dimensión oculta de GNN')
-    parser.add_argument('--latent-dim', type=int, default=64,
+    parser.add_argument('--latent-dim', type=int, default=128,
                        help='Dimensión latente para GVAE')
     parser.add_argument('--lstm-hidden', type=int, default=128,
                        help='Dimensión oculta de LSTM')
@@ -2066,7 +2104,7 @@ if __name__ == '__main__':
                        help='Número de capas LSTM')
     parser.add_argument('--dropout', type=float, default=0.3,
                        help='Dropout rate')
-    parser.add_argument('--kl-weight', type=float, default=0.001,
+    parser.add_argument('--kl-weight', type=float, default=0.01,
                        help='Peso para pérdida KL en GVAE')
     
     # Control de experimentos

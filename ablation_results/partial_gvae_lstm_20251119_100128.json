@@ -1,0 +1,56 @@
+{
+  "model": "GVAE+LSTM",
+  "metrics": {
+    "best_val_auroc": 0.5857142857142856,
+    "best_val_acc": 0.6756756756756757,
+    "best_val_f1": 0.7777777777777778,
+    "test_auroc": 0.5723076923076923,
+    "test_acc": 0.5789473684210527,
+    "test_f1": 0.68,
+    "best_threshold": 0.5488168001174927,
+    "history": {
+      "train_loss": [
+        168.40539901906794
+      ],
+      "train_task_loss": [
+        0.6875101653012362
+      ],
+      "train_vae_loss": [
+        1677.178810119629
+      ],
+      "val_loss": [
+        0.6392774224281311
+      ],
+      "val_auroc": [
+        0.5857142857142856
+      ],
+      "val_acc": [
+        0.6756756756756757
+      ],
+      "val_f1": [
+        0.7777777777777778
+      ],
+      "test_auroc": 0.5723076923076923,
+      "test_acc": 0.5789473684210527,
+      "test_f1": 0.68,
+      "test_precision": 0.68,
+      "test_recall": 0.68,
+      "best_threshold": 0.5488168001174927
+    }
+  },
+  "config": {
+    "score_threshold": 0.5,
+    "attn_threshold": 0.0,
+    "epochs": 1,
+    "batch_size": 8,
+    "lr": 0.001,
+    "gnn_hidden": 128,
+    "latent_dim": 128,
+    "lstm_hidden": 128,
+    "num_lstm_layers": 2,
+    "dropout": 0.3,
+    "kl_weight": 0.01,
+    "max_cache_batches": 2
+  },
+  "timestamp": "20251119_100128"
+}

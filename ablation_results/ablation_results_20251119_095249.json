@@ -1,0 +1,106 @@
+{
+  "LSTM-solo": {
+    "best_val_auroc": 0.8904761904761904,
+    "best_val_acc": 0.8108108108108109,
+    "best_val_f1": 0.8727272727272727,
+    "history": {
+      "train_loss": [
+        0.6762643727389249
+      ],
+      "val_loss": [
+        0.6001616716384888
+      ],
+      "val_auroc": [
+        0.8904761904761904
+      ],
+      "val_acc": [
+        0.8108108108108109
+      ],
+      "val_f1": [
+        0.8727272727272727
+      ],
+      "test_auroc": 0.7815384615384615,
+      "test_acc": 0.8157894736842105,
+      "test_f1": 0.8627450980392157,
+      "test_precision": 0.8461538461538461,
+      "test_recall": 0.88,
+      "best_threshold": 0.5896313190460205
+    }
+  },
+  "GNN-det+LSTM": {
+    "best_val_auroc": 0.9047619047619048,
+    "best_val_acc": 0.8918918918918919,
+    "best_val_f1": 0.9310344827586207,
+    "history": {
+      "train_loss": [
+        0.6748766140504316
+      ],
+      "val_loss": [
+        0.5646615326404572
+      ],
+      "val_auroc": [
+        0.9047619047619048
+      ],
+      "val_acc": [
+        0.8918918918918919
+      ],
+      "val_f1": [
+        0.9310344827586207
+      ],
+      "test_auroc": 0.72,
+      "test_acc": 0.7105263157894737,
+      "test_f1": 0.7924528301886793,
+      "test_precision": 0.75,
+      "test_recall": 0.84,
+      "best_threshold": 0.6387611031532288
+    }
+  },
+  "GVAE+LSTM": {
+    "best_val_auroc": 0.43333333333333335,
+    "best_val_acc": 0.2972972972972973,
+    "best_val_f1": 0.23529411764705882,
+    "history": {
+      "train_loss": [
+        397.5850480036302
+      ],
+      "train_task_loss": [
+        0.6790365143255754
+      ],
+      "train_vae_loss": [
+        3969.059950395064
+      ],
+      "val_loss": [
+        0.6338428020477295
+      ],
+      "val_auroc": [
+        0.43333333333333335
+      ],
+      "val_acc": [
+        0.2972972972972973
+      ],
+      "val_f1": [
+        0.23529411764705882
+      ],
+      "test_auroc": 0.5046153846153846,
+      "test_acc": 0.39473684210526316,
+      "test_f1": 0.20689655172413793,
+      "test_precision": 0.75,
+      "test_recall": 0.12,
+      "best_threshold": 0.559421718120575
+    }
+  },
+  "config": {
+    "score_threshold": 0.5,
+    "attn_threshold": 0.0,
+    "epochs": 1,
+    "batch_size": 8,
+    "lr": 0.001,
+    "gnn_hidden": 128,
+    "latent_dim": 64,
+    "lstm_hidden": 128,
+    "num_lstm_layers": 2,
+    "dropout": 0.3,
+    "kl_weight": 0.001,
+    "max_cache_batches": 2
+  }
+}
