@@ -975,10 +975,10 @@ def evaluate_model(model, data_loader, device, threshold=0.5, is_gvae=False):
                 layer_sequence = batched_by_layer.to(device, dtype=torch.float32, non_blocking=True)
                 logits = model(layer_sequence)
             else:
-                # Datos raw (grafos)
+                # Datos raw (grafos) - convertir a float32 para evitar dtype mismatch
                 batched_by_layer_gpu = []
                 for layer_data in batched_by_layer:
-                    batched_by_layer_gpu.append(layer_data.to(device, non_blocking=True))
+                    batched_by_layer_gpu.append(layer_data.to(device, dtype=torch.float32, non_blocking=True))
                 
                 if is_gvae:
                     # GVAE devuelve múltiples salidas
@@ -1239,8 +1239,8 @@ def train_gnn_det_lstm(model, train_loader, val_loader, test_loader, device, epo
         for batched_by_layer, labels, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
             labels = labels.to(device).unsqueeze(1)
             
-            # Mover datos a device
-            batched_by_layer = [data.to(device) for data in batched_by_layer]
+            # Mover datos a device y convertir a float32 si es necesario
+            batched_by_layer = [data.to(device, dtype=torch.float32) for data in batched_by_layer]
             
             optimizer.zero_grad()
             logits = model(batched_by_layer, len(batched_by_layer))
@@ -1267,7 +1267,8 @@ def train_gnn_det_lstm(model, train_loader, val_loader, test_loader, device, epo
         with torch.no_grad():
             for batched_by_layer, labels, _ in val_loader:
                 labels = labels.to(device).unsqueeze(1)
-                batched_by_layer = [data.to(device) for data in batched_by_layer]
+                # Convertir a float32 para evitar dtype mismatch
+                batched_by_layer = [data.to(device, dtype=torch.float32) for data in batched_by_layer]
                 
                 logits = model(batched_by_layer, len(batched_by_layer))
                 loss = criterion(logits, labels)
@@ -1366,7 +1367,8 @@ def train_gvae_lstm(model, train_loader, val_loader, test_loader, device, epochs
         
         for batched_by_layer, labels, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
             labels = labels.to(device).unsqueeze(1)
-            batched_by_layer = [data.to(device) for data in batched_by_layer]
+            # Convertir a float32 para evitar dtype mismatch
+            batched_by_layer = [data.to(device, dtype=torch.float32) for data in batched_by_layer]
             
             optimizer.zero_grad()
             logits, mu_list, logvar_list, orig_list, recon_list = model(
@@ -1409,7 +1411,8 @@ def train_gvae_lstm(model, train_loader, val_loader, test_loader, device, epochs
         with torch.no_grad():
             for batched_by_layer, labels, _ in val_loader:
                 labels = labels.to(device).unsqueeze(1)
-                batched_by_layer = [data.to(device) for data in batched_by_layer]
+                # Convertir a float32 para evitar dtype mismatch
+                batched_by_layer = [data.to(device, dtype=torch.float32) for data in batched_by_layer]
                 
                 logits, _, _, _, _ = model(batched_by_layer, len(batched_by_layer))
                 loss = criterion(logits, labels)
@@ -1717,6 +1720,24 @@ def run_ablation_experiments(args):
     output_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
+    # Función auxiliar para convertir tipos numpy/torch a tipos nativos Python
+    def convert_to_serializable(obj):
+        """Convierte numpy/torch types a tipos nativos de Python para JSON"""
+        if isinstance(obj, dict):
+            return {key: convert_to_serializable(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_to_serializable(item) for item in obj]
+        elif isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif hasattr(obj, 'item'):  # torch tensors
+            return obj.item()
+        else:
+            return obj
+    
     # Función auxiliar para guardar resultados parciales
     def save_partial_results(model_name, metrics, config):
         """Guarda resultados de un modelo inmediatamente después de entrenar"""
@@ -1728,11 +1749,18 @@ def run_ablation_experiments(args):
                 'best_val_auroc': metrics['best_val_auroc'],
                 'best_val_acc': metrics['best_val_acc'],
                 'best_val_f1': metrics['best_val_f1'],
+                'test_auroc': metrics.get('test_auroc', 0.0),
+                'test_acc': metrics.get('test_acc', 0.0),
+                'test_f1': metrics.get('test_f1', 0.0),
+                'best_threshold': metrics.get('best_threshold', 0.5),
                 'history': metrics['history']
             },
             'config': config,
             'timestamp': timestamp
         }
+        
+        # Convertir a tipos serializables
+        partial_results = convert_to_serializable(partial_results)
         
         with open(partial_file, 'w') as f:
             json.dump(partial_results, f, indent=2)
@@ -1978,6 +2006,9 @@ def run_ablation_experiments(args):
         
         # Agregar configuración
         results_json['config'] = shared_config
+        
+        # Convertir a tipos serializables
+        results_json = convert_to_serializable(results_json)
         
         with open(results_file, 'w') as f:
             json.dump(results_json, f, indent=2)
