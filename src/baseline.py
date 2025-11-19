@@ -923,8 +923,99 @@ def collate_sequential_batch(batch):
 # ============================================================================
 # ENTRENAMIENTO Y EVALUACIÓN
 # ============================================================================
+# Funciones auxiliares para evaluación
+# ============================================================================
 
-def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0.001):
+def find_optimal_threshold(labels, probs):
+    """
+    Encuentra el threshold óptimo maximizando Youden's J statistic (sensitivity + specificity - 1).
+    Este threshold es óptimo para AUROC ya que maximiza la distancia a la línea diagonal en la curva ROC.
+    
+    También conocido como el punto más cercano a (0,1) en la curva ROC.
+    """
+    from sklearn.metrics import roc_curve
+    
+    # Calcular curva ROC
+    fpr, tpr, thresholds = roc_curve(labels, probs)
+    
+    # Youden's J statistic = Sensitivity + Specificity - 1
+    # Sensitivity = TPR (True Positive Rate)
+    # Specificity = 1 - FPR (False Positive Rate)
+    # J = TPR + (1 - FPR) - 1 = TPR - FPR
+    youdens_j = tpr - fpr
+    
+    # Encontrar el threshold que maximiza J
+    optimal_idx = np.argmax(youdens_j)
+    optimal_threshold = thresholds[optimal_idx]
+    
+    # Calcular F1 en el threshold óptimo para reportar
+    optimal_preds = (probs >= optimal_threshold).astype(int)
+    optimal_f1 = f1_score(labels, optimal_preds, zero_division=0)
+    
+    return optimal_threshold, optimal_f1
+
+
+def evaluate_model(model, data_loader, device, threshold=0.5, is_gvae=False):
+    """
+    Evalúa un modelo en un conjunto de datos y retorna métricas.
+    Compatible con LSTM, GNN-det y GVAE.
+    """
+    model.eval()
+    all_probs = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for batch_data in data_loader:
+            batched_by_layer, labels, _ = batch_data
+            labels = labels.to(device, non_blocking=True).unsqueeze(1)
+            
+            # Detectar tipo de datos y procesar según modelo
+            if isinstance(batched_by_layer, torch.Tensor):
+                # Datos preprocesados LSTM
+                layer_sequence = batched_by_layer.to(device, dtype=torch.float32, non_blocking=True)
+                logits = model(layer_sequence)
+            else:
+                # Datos raw (grafos)
+                batched_by_layer_gpu = []
+                for layer_data in batched_by_layer:
+                    batched_by_layer_gpu.append(layer_data.to(device, non_blocking=True))
+                
+                if is_gvae:
+                    # GVAE devuelve múltiples salidas
+                    logits, _, _, _, _ = model(batched_by_layer_gpu, len(batched_by_layer_gpu))
+                else:
+                    # GNN-det o LSTM desde grafos
+                    logits = model(batched_by_layer_gpu)
+            
+            probs = torch.sigmoid(logits)
+            all_probs.extend(probs.cpu().numpy().flatten())
+            all_labels.extend(labels.cpu().numpy().flatten())
+    
+    # Calcular métricas
+    all_probs = np.array(all_probs)
+    all_labels = np.array(all_labels)
+    all_preds = (all_probs > threshold).astype(float)
+    
+    metrics = {
+        'auroc': roc_auc_score(all_labels, all_probs),
+        'accuracy': accuracy_score(all_labels, all_preds),
+        'precision': precision_score(all_labels, all_preds, zero_division=0),
+        'recall': recall_score(all_labels, all_preds, zero_division=0),
+        'f1': f1_score(all_labels, all_preds, zero_division=0),
+        'threshold': threshold,
+        'probs': all_probs,
+        'labels': all_labels,
+        'preds': all_preds
+    }
+    
+    return metrics
+
+
+# ============================================================================
+# Funciones de entrenamiento
+# ============================================================================
+
+def train_lstm_baseline(model, train_loader, val_loader, test_loader, device, epochs=50, lr=0.001):
     """
     Entrena el modelo LSTM Baseline con clasificación binaria.
     OPTIMIZADO PARA MEMORIA: Libera memoria GPU/RAM regularmente.
@@ -939,6 +1030,7 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
     
     history = {'train_loss': [], 'val_loss': [], 'val_auroc': [], 'val_acc': [], 'val_f1': []}
     best_val_auroc = 0.0
+    best_threshold = 0.5  # Inicializar threshold
     
     for epoch in range(epochs):
         # Training
@@ -1074,10 +1166,20 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
         
-        # Calcular métricas
+        # Encontrar threshold óptimo en validación
+        all_probs = np.array(all_probs)
+        all_labels = np.array(all_labels)
+        optimal_threshold, optimal_f1 = find_optimal_threshold(all_labels, all_probs)
+        
+        # Recalcular predicciones con threshold óptimo
+        all_preds_optimal = (all_probs > optimal_threshold).astype(float)
+        
+        # Calcular métricas con threshold óptimo
         val_auroc = roc_auc_score(all_labels, all_probs)
-        val_acc = accuracy_score(all_labels, all_preds)
-        val_f1 = f1_score(all_labels, all_preds)
+        val_acc = accuracy_score(all_labels, all_preds_optimal)
+        val_f1 = f1_score(all_labels, all_preds_optimal, zero_division=0)
+        val_precision = precision_score(all_labels, all_preds_optimal, zero_division=0)
+        val_recall = recall_score(all_labels, all_preds_optimal, zero_division=0)
         
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
@@ -1086,16 +1188,39 @@ def train_lstm_baseline(model, train_loader, val_loader, device, epochs=50, lr=0
         history['val_f1'].append(val_f1)
         
         print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, "
-              f"AUROC={val_auroc:.4f}, Acc={val_acc:.4f}, F1={val_f1:.4f}")
+              f"AUROC={val_auroc:.4f}, Acc={val_acc:.4f}, F1={val_f1:.4f} (thr={optimal_threshold:.3f})")
         
         if val_auroc > best_val_auroc:
             best_val_auroc = val_auroc
+            best_threshold = optimal_threshold
             torch.save(model.state_dict(), 'best_lstm_baseline.pt')
+    
+    # Evaluación final en conjunto de test
+    print("\n" + "="*80)
+    print("EVALUACIÓN EN CONJUNTO DE TEST")
+    print("="*80)
+    model.load_state_dict(torch.load('best_lstm_baseline.pt'))
+    test_metrics = evaluate_model(model, test_loader, device, threshold=best_threshold, is_gvae=False)
+    
+    print(f"\nMétricas en TEST (threshold={best_threshold:.3f}):")
+    print(f"  AUROC:     {test_metrics['auroc']:.4f}")
+    print(f"  Accuracy:  {test_metrics['accuracy']:.4f}")
+    print(f"  Precision: {test_metrics['precision']:.4f}")
+    print(f"  Recall:    {test_metrics['recall']:.4f}")
+    print(f"  F1-Score:  {test_metrics['f1']:.4f}")
+    
+    # Agregar métricas de test al historial
+    history['test_auroc'] = test_metrics['auroc']
+    history['test_acc'] = test_metrics['accuracy']
+    history['test_f1'] = test_metrics['f1']
+    history['test_precision'] = test_metrics['precision']
+    history['test_recall'] = test_metrics['recall']
+    history['best_threshold'] = best_threshold
     
     return history
 
 
-def train_gnn_det_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.001):
+def train_gnn_det_lstm(model, train_loader, val_loader, test_loader, device, epochs=50, lr=0.001):
     """
     Entrena el modelo GNN-det+LSTM con clasificación binaria.
     OPTIMIZADO PARA MEMORIA: Libera memoria GPU/RAM regularmente.
@@ -1106,6 +1231,7 @@ def train_gnn_det_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.
     
     history = {'train_loss': [], 'val_loss': [], 'val_auroc': [], 'val_acc': [], 'val_f1': []}
     best_val_auroc = 0.0
+    best_threshold = 0.5  # Inicializar threshold
     
     for epoch in range(epochs):
         model.train()
@@ -1166,10 +1292,18 @@ def train_gnn_det_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.
         train_loss /= len(train_loader)
         val_loss /= len(val_loader)
         
-        # Calcular métricas
+        # Encontrar threshold óptimo en validación (Youden's J para AUROC)
+        all_probs = np.array(all_probs)
+        all_labels = np.array(all_labels)
+        optimal_threshold, optimal_f1 = find_optimal_threshold(all_labels, all_probs)
+        
+        # Recalcular predicciones con threshold óptimo
+        all_preds_optimal = (all_probs > optimal_threshold).astype(float)
+        
+        # Calcular métricas con threshold óptimo
         val_auroc = roc_auc_score(all_labels, all_probs)
-        val_acc = accuracy_score(all_labels, all_preds)
-        val_f1 = f1_score(all_labels, all_preds)
+        val_acc = accuracy_score(all_labels, all_preds_optimal)
+        val_f1 = f1_score(all_labels, all_preds_optimal, zero_division=0)
         
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
@@ -1178,16 +1312,39 @@ def train_gnn_det_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.
         history['val_f1'].append(val_f1)
         
         print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, "
-              f"AUROC={val_auroc:.4f}, Acc={val_acc:.4f}, F1={val_f1:.4f}")
+              f"AUROC={val_auroc:.4f}, Acc={val_acc:.4f}, F1={val_f1:.4f} (thr={optimal_threshold:.3f})")
         
         if val_auroc > best_val_auroc:
             best_val_auroc = val_auroc
+            best_threshold = optimal_threshold
             torch.save(model.state_dict(), 'best_gnn_det_lstm.pt')
+    
+    # Evaluación final en conjunto de test
+    print("\n" + "="*80)
+    print("EVALUACIÓN EN CONJUNTO DE TEST")
+    print("="*80)
+    model.load_state_dict(torch.load('best_gnn_det_lstm.pt'))
+    test_metrics = evaluate_model(model, test_loader, device, threshold=best_threshold, is_gvae=False)
+    
+    print(f"\nMétricas en TEST (threshold={best_threshold:.3f}):")
+    print(f"  AUROC:     {test_metrics['auroc']:.4f}")
+    print(f"  Accuracy:  {test_metrics['accuracy']:.4f}")
+    print(f"  Precision: {test_metrics['precision']:.4f}")
+    print(f"  Recall:    {test_metrics['recall']:.4f}")
+    print(f"  F1-Score:  {test_metrics['f1']:.4f}")
+    
+    # Agregar métricas de test al historial
+    history['test_auroc'] = test_metrics['auroc']
+    history['test_acc'] = test_metrics['accuracy']
+    history['test_f1'] = test_metrics['f1']
+    history['test_precision'] = test_metrics['precision']
+    history['test_recall'] = test_metrics['recall']
+    history['best_threshold'] = best_threshold
     
     return history
 
 
-def train_gvae_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.001, kl_weight=0.001):
+def train_gvae_lstm(model, train_loader, val_loader, test_loader, device, epochs=50, lr=0.001, kl_weight=0.001):
     """
     Entrena el modelo GVAE+LSTM con clasificación binaria.
     OPTIMIZADO PARA MEMORIA: Libera memoria GPU/RAM regularmente.
@@ -1199,6 +1356,7 @@ def train_gvae_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.001
     history = {'train_loss': [], 'train_task_loss': [], 'train_vae_loss': [],
                'val_loss': [], 'val_auroc': [], 'val_acc': [], 'val_f1': []}
     best_val_auroc = 0.0
+    best_threshold = 0.5  # Inicializar threshold
     
     for epoch in range(epochs):
         model.train()
@@ -1278,10 +1436,18 @@ def train_gvae_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.001
         train_vae_loss /= len(train_loader)
         val_loss /= len(val_loader)
         
-        # Calcular métricas
+        # Encontrar threshold óptimo en validación (Youden's J para AUROC)
+        all_probs = np.array(all_probs)
+        all_labels = np.array(all_labels)
+        optimal_threshold, optimal_f1 = find_optimal_threshold(all_labels, all_probs)
+        
+        # Recalcular predicciones con threshold óptimo
+        all_preds_optimal = (all_probs > optimal_threshold).astype(float)
+        
+        # Calcular métricas con threshold óptimo
         val_auroc = roc_auc_score(all_labels, all_probs)
-        val_acc = accuracy_score(all_labels, all_preds)
-        val_f1 = f1_score(all_labels, all_preds)
+        val_acc = accuracy_score(all_labels, all_preds_optimal)
+        val_f1 = f1_score(all_labels, all_preds_optimal, zero_division=0)
         
         history['train_loss'].append(train_loss)
         history['train_task_loss'].append(train_task_loss)
@@ -1292,11 +1458,34 @@ def train_gvae_lstm(model, train_loader, val_loader, device, epochs=50, lr=0.001
         history['val_f1'].append(val_f1)
         
         print(f"Epoch {epoch+1}: Train Loss={train_loss:.4f} (Task={train_task_loss:.4f}, VAE={train_vae_loss:.4f}), "
-              f"Val Loss={val_loss:.4f}, AUROC={val_auroc:.4f}, Acc={val_acc:.4f}, F1={val_f1:.4f}")
+              f"Val Loss={val_loss:.4f}, AUROC={val_auroc:.4f}, Acc={val_acc:.4f}, F1={val_f1:.4f} (thr={optimal_threshold:.3f})")
         
         if val_auroc > best_val_auroc:
             best_val_auroc = val_auroc
+            best_threshold = optimal_threshold
             torch.save(model.state_dict(), 'best_gvae_lstm.pt')
+    
+    # Evaluación final en conjunto de test
+    print("\n" + "="*80)
+    print("EVALUACIÓN EN CONJUNTO DE TEST")
+    print("="*80)
+    model.load_state_dict(torch.load('best_gvae_lstm.pt'))
+    test_metrics = evaluate_model(model, test_loader, device, threshold=best_threshold, is_gvae=True)
+    
+    print(f"\nMétricas en TEST (threshold={best_threshold:.3f}):")
+    print(f"  AUROC:     {test_metrics['auroc']:.4f}")
+    print(f"  Accuracy:  {test_metrics['accuracy']:.4f}")
+    print(f"  Precision: {test_metrics['precision']:.4f}")
+    print(f"  Recall:    {test_metrics['recall']:.4f}")
+    print(f"  F1-Score:  {test_metrics['f1']:.4f}")
+    
+    # Agregar métricas de test al historial
+    history['test_auroc'] = test_metrics['auroc']
+    history['test_acc'] = test_metrics['accuracy']
+    history['test_f1'] = test_metrics['f1']
+    history['test_precision'] = test_metrics['precision']
+    history['test_recall'] = test_metrics['recall']
+    history['best_threshold'] = best_threshold
     
     return history
 
@@ -1382,11 +1571,14 @@ def run_ablation_experiments(args):
         print(f"  Test: {len(test_dataset_lstm)}")
         
         # Configurar num_workers
-        num_workers = min(4, os.cpu_count() or 1)
+        # IMPORTANTE: Con lazy loading, usar num_workers=0 para evitar problemas de memoria
+        # Los workers intentan cargar datos en paralelo, lo cual causa OOM con el cache LRU
+        num_workers = 0  # Desactivado para lazy loading
         
         print(f"\nConfigurando DataLoaders:")
-        print(f"  - num_workers: {num_workers} (prefetching paralelo)")
+        print(f"  - num_workers: {num_workers} (lazy loading requiere num_workers=0)")
         print(f"  - pin_memory: True (transferencias GPU más rápidas)")
+        print(f"  ⚠️  Nota: num_workers desactivado para evitar OOM con lazy loading")
         
         # DataLoaders para LSTM
         train_loader_lstm = DataLoader(
@@ -1396,7 +1588,7 @@ def run_ablation_experiments(args):
             collate_fn=collate_lstm_batch,
             num_workers=num_workers,
             pin_memory=device.type == 'cuda',
-            persistent_workers=num_workers > 0
+            persistent_workers=False
         )
         val_loader_lstm = DataLoader(
             val_dataset_lstm,
@@ -1423,7 +1615,7 @@ def run_ablation_experiments(args):
             collate_fn=collate_gnn_batch,
             num_workers=num_workers,
             pin_memory=device.type == 'cuda',
-            persistent_workers=num_workers > 0
+            persistent_workers=False
         )
         val_loader_gnn = DataLoader(
             val_dataset_gnn,
@@ -1520,6 +1712,50 @@ def run_ablation_experiments(args):
     
     results = {}
     
+    # Crear directorio de salida
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Función auxiliar para guardar resultados parciales
+    def save_partial_results(model_name, metrics, config):
+        """Guarda resultados de un modelo inmediatamente después de entrenar"""
+        partial_file = output_dir / f"partial_{model_name.lower().replace('+', '_').replace('-', '_')}_{timestamp}.json"
+        
+        partial_results = {
+            'model': model_name,
+            'metrics': {
+                'best_val_auroc': metrics['best_val_auroc'],
+                'best_val_acc': metrics['best_val_acc'],
+                'best_val_f1': metrics['best_val_f1'],
+                'history': metrics['history']
+            },
+            'config': config,
+            'timestamp': timestamp
+        }
+        
+        with open(partial_file, 'w') as f:
+            json.dump(partial_results, f, indent=2)
+        
+        print(f"\n✅ Resultados de {model_name} guardados en: {partial_file}")
+        return partial_file
+    
+    # Configuración compartida para todos los modelos
+    shared_config = {
+        'score_threshold': args.score_threshold,
+        'attn_threshold': args.attn_threshold if hasattr(args, 'attn_threshold') else None,
+        'epochs': args.epochs,
+        'batch_size': args.batch_size,
+        'lr': args.lr,
+        'gnn_hidden': args.gnn_hidden,
+        'latent_dim': args.latent_dim,
+        'lstm_hidden': args.lstm_hidden,
+        'num_lstm_layers': args.num_lstm_layers,
+        'dropout': args.dropout,
+        'kl_weight': args.kl_weight,
+        'max_cache_batches': args.max_cache_batches if hasattr(args, 'max_cache_batches') else None,
+    }
+    
     # ========================================================================
     # EXPERIMENTO 1: LSTM Baseline
     # ========================================================================
@@ -1537,17 +1773,37 @@ def run_ablation_experiments(args):
         
         print(f"Parámetros del modelo: {sum(p.numel() for p in model_lstm.parameters()):,}")
         
-        history_lstm = train_lstm_baseline(
-            model_lstm, train_loader_lstm, val_loader_lstm, device,
-            epochs=args.epochs, lr=args.lr
-        )
-        
-        results['LSTM-solo'] = {
-            'best_val_auroc': max(history_lstm['val_auroc']),
-            'best_val_acc': max(history_lstm['val_acc']),
-            'best_val_f1': max(history_lstm['val_f1']),
-            'history': history_lstm
-        }
+        try:
+            history_lstm = train_lstm_baseline(
+                model_lstm, train_loader_lstm, val_loader_lstm, test_loader_lstm, device,
+                epochs=args.epochs, lr=args.lr
+            )
+            
+            results['LSTM-solo'] = {
+                'best_val_auroc': max(history_lstm['val_auroc']),
+                'best_val_acc': max(history_lstm['val_acc']),
+                'best_val_f1': max(history_lstm['val_f1']),
+                'test_auroc': history_lstm.get('test_auroc', 0.0),
+                'test_acc': history_lstm.get('test_acc', 0.0),
+                'test_f1': history_lstm.get('test_f1', 0.0),
+                'best_threshold': history_lstm.get('best_threshold', 0.5),
+                'history': history_lstm
+            }
+            
+            # Guardar inmediatamente después de entrenar
+            save_partial_results('LSTM-solo', results['LSTM-solo'], shared_config)
+            
+            # Liberar memoria del modelo
+            del model_lstm, history_lstm
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+            
+        except Exception as e:
+            print(f"\n❌ Error durante entrenamiento de LSTM-solo: {e}")
+            import traceback
+            traceback.print_exc()
+            # Continuar con el siguiente modelo
     
     # ========================================================================
     # EXPERIMENTO 2: GNN-det+LSTM
@@ -1567,17 +1823,37 @@ def run_ablation_experiments(args):
         
         print(f"Parámetros del modelo: {sum(p.numel() for p in model_gnn.parameters()):,}")
         
-        history_gnn = train_gnn_det_lstm(
-            model_gnn, train_loader_gnn, val_loader_gnn, device,
-            epochs=args.epochs, lr=args.lr
-        )
-        
-        results['GNN-det+LSTM'] = {
-            'best_val_auroc': max(history_gnn['val_auroc']),
-            'best_val_acc': max(history_gnn['val_acc']),
-            'best_val_f1': max(history_gnn['val_f1']),
-            'history': history_gnn
-        }
+        try:
+            history_gnn = train_gnn_det_lstm(
+                model_gnn, train_loader_gnn, val_loader_gnn, test_loader_gnn, device,
+                epochs=args.epochs, lr=args.lr
+            )
+            
+            results['GNN-det+LSTM'] = {
+                'best_val_auroc': max(history_gnn['val_auroc']),
+                'best_val_acc': max(history_gnn['val_acc']),
+                'best_val_f1': max(history_gnn['val_f1']),
+                'test_auroc': history_gnn.get('test_auroc', 0.0),
+                'test_acc': history_gnn.get('test_acc', 0.0),
+                'test_f1': history_gnn.get('test_f1', 0.0),
+                'best_threshold': history_gnn.get('best_threshold', 0.5),
+                'history': history_gnn
+            }
+            
+            # Guardar inmediatamente después de entrenar
+            save_partial_results('GNN-det+LSTM', results['GNN-det+LSTM'], shared_config)
+            
+            # Liberar memoria del modelo
+            del model_gnn, history_gnn
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+            
+        except Exception as e:
+            print(f"\n❌ Error durante entrenamiento de GNN-det+LSTM: {e}")
+            import traceback
+            traceback.print_exc()
+            # Continuar con el siguiente modelo
     
     # ========================================================================
     # EXPERIMENTO 3: GVAE+LSTM
@@ -1598,17 +1874,37 @@ def run_ablation_experiments(args):
         
         print(f"Parámetros del modelo: {sum(p.numel() for p in model_gvae.parameters()):,}")
         
-        history_gvae = train_gvae_lstm(
-            model_gvae, train_loader_gnn, val_loader_gnn, device,
-            epochs=args.epochs, lr=args.lr, kl_weight=args.kl_weight
-        )
-        
-        results['GVAE+LSTM'] = {
-            'best_val_auroc': max(history_gvae['val_auroc']),
-            'best_val_acc': max(history_gvae['val_acc']),
-            'best_val_f1': max(history_gvae['val_f1']),
-            'history': history_gvae
-        }
+        try:
+            history_gvae = train_gvae_lstm(
+                model_gvae, train_loader_gnn, val_loader_gnn, test_loader_gnn, device,
+                epochs=args.epochs, lr=args.lr, kl_weight=args.kl_weight
+            )
+            
+            results['GVAE+LSTM'] = {
+                'best_val_auroc': max(history_gvae['val_auroc']),
+                'best_val_acc': max(history_gvae['val_acc']),
+                'best_val_f1': max(history_gvae['val_f1']),
+                'test_auroc': history_gvae.get('test_auroc', 0.0),
+                'test_acc': history_gvae.get('test_acc', 0.0),
+                'test_f1': history_gvae.get('test_f1', 0.0),
+                'best_threshold': history_gvae.get('best_threshold', 0.5),
+                'history': history_gvae
+            }
+            
+            # Guardar inmediatamente después de entrenar
+            save_partial_results('GVAE+LSTM', results['GVAE+LSTM'], shared_config)
+            
+            # Liberar memoria del modelo
+            del model_gvae, history_gvae
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+            
+        except Exception as e:
+            print(f"\n❌ Error durante entrenamiento de GVAE+LSTM: {e}")
+            import traceback
+            traceback.print_exc()
+            # Continuar (o terminar si es el último modelo)
     
     # ========================================================================
     # RESULTADOS Y CONCLUSIONES
@@ -1616,6 +1912,11 @@ def run_ablation_experiments(args):
     print("\n" + "="*80)
     print("RESULTADOS FINALES - TABLA DE ABLACIÓN")
     print("="*80)
+    
+    if len(results) == 0:
+        print("\n⚠️  No se entrenó ningún modelo exitosamente.")
+        print("Revisa los archivos parciales en el directorio de salida para más detalles.")
+        return
     
     print("\nMétrica Principal: AUROC (Mayor es mejor)")
     print("-" * 80)
@@ -1653,38 +1954,45 @@ def run_ablation_experiments(args):
         else:
             print("\n❌ HIPÓTESIS NO CONFIRMADA:")
             print("   Los resultados sugieren revisar la arquitectura o hiperparámetros.")
+    else:
+        print(f"\n⚠️  Solo {len(results)} modelo(s) entrenado(s) exitosamente.")
+        print("No se puede realizar comparación completa de ablación.")
+        print("\nResultados parciales disponibles en:")
+        for model_name in results.keys():
+            partial_name = model_name.lower().replace('+', '_').replace('-', '_')
+            print(f"  - partial_{partial_name}_{timestamp}.json")
     
-    # Guardar resultados
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(exist_ok=True)
+    # Guardar resultados finales consolidados (solo si hay resultados)
+    if len(results) > 0:
+        results_file = output_dir / f"ablation_results_{timestamp}.json"
+        
+        # Convertir historia a listas para JSON
+        results_json = {}
+        for model_name, metrics in results.items():
+            results_json[model_name] = {
+                'best_val_auroc': metrics['best_val_auroc'],
+                'best_val_acc': metrics['best_val_acc'],
+                'best_val_f1': metrics['best_val_f1'],
+                'history': {k: v for k, v in metrics['history'].items()}
+            }
+        
+        # Agregar configuración
+        results_json['config'] = shared_config
+        
+        with open(results_file, 'w') as f:
+            json.dump(results_json, f, indent=2)
+        
+        print(f"\n✅ Resultados consolidados guardados en: {results_file}")
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_file = output_dir / f"ablation_results_{timestamp}.json"
-    
-    # Convertir historia a listas para JSON
-    results_json = {}
-    for model_name, metrics in results.items():
-        results_json[model_name] = {
-            'best_val_auroc': metrics['best_val_auroc'],
-            'best_val_acc': metrics['best_val_acc'],
-            'best_val_f1': metrics['best_val_f1'],
-            'history': {k: v for k, v in metrics['history'].items()}
-        }
-    
-    # Agregar configuración
-    results_json['config'] = {
-        'score_threshold': args.score_threshold,
-        'attn_threshold': args.attn_threshold,
-        'epochs': args.epochs,
-        'batch_size': args.batch_size,
-        'lr': args.lr,
-    }
-    
-    with open(results_file, 'w') as f:
-        json.dump(results_json, f, indent=2)
-    
-    print(f"\n✅ Resultados guardados en: {results_file}")
     print("\n" + "="*80)
+    print("ARCHIVOS GUARDADOS:")
+    print("="*80)
+    for model_name in results.keys():
+        partial_name = model_name.lower().replace('+', '_').replace('-', '_')
+        print(f"  ✓ partial_{partial_name}_{timestamp}.json")
+    if len(results) > 0:
+        print(f"  ✓ ablation_results_{timestamp}.json (consolidado)")
+    print("="*80)
 
 
 if __name__ == '__main__':
@@ -1721,7 +2029,7 @@ if __name__ == '__main__':
                        help='Dimensión oculta de GNN')
     parser.add_argument('--latent-dim', type=int, default=64,
                        help='Dimensión latente para GVAE')
-    parser.add_argument('--lstm-hidden', type=int, default=256,
+    parser.add_argument('--lstm-hidden', type=int, default=128,
                        help='Dimensión oculta de LSTM')
     parser.add_argument('--num-lstm-layers', type=int, default=2,
                        help='Número de capas LSTM')
