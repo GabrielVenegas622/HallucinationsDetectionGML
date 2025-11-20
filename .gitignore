@@ -8,3 +8,4 @@ traces_data/
 .ipynb_checkpoints/
 preprocessed_data/
 ablation_results/
+*.png
