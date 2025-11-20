@@ -548,10 +548,16 @@ class PreprocessedLSTMDataset(IterableDataset):
             del batch_data
             gc.collect()
         
+        self.total_traces = total_traces
+        
         print(f"✅ Dataset LSTM (Iterable): {total_traces} traces en {len(self.batch_files)} archivos")
         print(f"   💾 Memoria: 1 archivo por worker (máx ~{max(self.batch_sizes)} traces)")
         print(f"   🔀 Shuffle: Buffer local de {shuffle_buffer_size} traces")
         print(f"   ⚡ Soporta num_workers > 0 para paralelización")
+    
+    def __len__(self):
+        """Retorna el número total de traces en el dataset"""
+        return self.total_traces
     
     def _get_worker_files(self):
         """Divide archivos entre workers"""
@@ -671,10 +677,16 @@ class PreprocessedGNNDataset(IterableDataset):
             del batch_data
             gc.collect()
         
+        self.total_traces = total_traces
+        
         print(f"✅ Dataset GNN (Iterable): {total_traces} traces en {len(self.batch_files)} archivos")
         print(f"   💾 Memoria: 1 archivo por worker (máx ~{max(self.batch_sizes)} traces)")
         print(f"   🔀 Shuffle: Buffer local de {shuffle_buffer_size} traces")
         print(f"   ⚡ Soporta num_workers > 0 para paralelización")
+    
+    def __len__(self):
+        """Retorna el número total de traces en el dataset"""
+        return self.total_traces
     
     def _get_worker_files(self):
         """Divide archivos entre workers"""
