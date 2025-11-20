@@ -2229,7 +2229,7 @@ if __name__ == '__main__':
                        help='Learning rate')
     
     # Arquitectura
-    parser.add_argument('--gnn-hidden', type=int, default=128,
+    parser.add_argument('--gnn-hidden', type=int, default=1024,
                        help='Dimensión oculta de GNN')
     parser.add_argument('--latent-dim', type=int, default=128,
                        help='Dimensión latente para GVAE')
