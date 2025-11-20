@@ -275,9 +275,9 @@ def main():
     
     # Buscar archivos más recientes para cada modelo
     patterns = {
-        'lstm': str(results_dir / "lstm_only_*.json"),
-        'gnn_det': str(results_dir / "gnn_det_lstm_*.json"),
-        'gnn_vae': str(results_dir / "gnn_vae_lstm_*.json")
+        'lstm': str(results_dir / "partial_lstm_solo_*.json"),
+        'gnn_det': str(results_dir / "partial_gnn_det_lstm_*.json"),
+        'gnn_vae': str(results_dir / "partial_gnn_vae_lstm_*.json")
     }
     
     results_data = {}

@@ -122,8 +122,9 @@ class GNNDetLSTM(nn.Module):
     
     Pipeline:
     1. Para cada capa: GINE (con edge features) extrae representación considerando estructura Y pesos
-    2. Secuencia de representaciones por capa → LSTM
-    3. Clasificación final
+    2. Last Token Readout con conexión residual (concatena embedding original + procesado)
+    3. Secuencia de representaciones por capa → LSTM
+    4. Clasificación final
     """
     def __init__(self, hidden_dim, gnn_hidden=128, lstm_hidden=256, 
                  num_lstm_layers=2, dropout=0.3):
@@ -153,8 +154,9 @@ class GNNDetLSTM(nn.Module):
         )
         
         # LSTM sobre la secuencia de representaciones de grafos
+        # Ahora recibe hidden_dim + gnn_hidden debido a la concatenación residual
         self.lstm = nn.LSTM(
-            input_size=gnn_hidden,
+            input_size=hidden_dim + gnn_hidden,
             hidden_size=lstm_hidden,
             num_layers=num_lstm_layers,
             batch_first=True,
@@ -178,9 +180,9 @@ class GNNDetLSTM(nn.Module):
         """
         layer_representations = []
         
-        # Procesar cada capa con GINE (usando edge_attr)
+        # Procesar cada capa con GINE (usando edge_attr) + Last Token Readout
         for layer_idx, layer_data in enumerate(batched_graphs_by_layer):
-            x, edge_index, edge_attr, batch = (
+            x_original, edge_index, edge_attr, batch = (
                 layer_data.x, 
                 layer_data.edge_index, 
                 layer_data.edge_attr,
@@ -188,9 +190,9 @@ class GNNDetLSTM(nn.Module):
             )
             
             # Validar que x no tenga NaN o Inf
-            if torch.isnan(x).any() or torch.isinf(x).any():
+            if torch.isnan(x_original).any() or torch.isinf(x_original).any():
                 print(f"WARNING: NaN o Inf detectado en x de capa {layer_idx}")
-                x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+                x_original = torch.nan_to_num(x_original, nan=0.0, posinf=1e6, neginf=-1e6)
             
             # Manejo seguro de edge_attr
             if edge_attr is not None and edge_attr.numel() > 0:
@@ -219,33 +221,60 @@ class GNNDetLSTM(nn.Module):
                 edge_attr = torch.clamp(edge_attr, min=0.0, max=1.0)
             else:
                 # Si no hay arcos, crear edge_attr vacío con forma correcta
-                edge_attr = torch.zeros((0, 1), dtype=torch.float, device=x.device)
+                edge_attr = torch.zeros((0, 1), dtype=torch.float, device=x_original.device)
             
             # GINE encoding: propaga información considerando pesos de atención
             try:
-                x = F.relu(self.conv1(x, edge_index, edge_attr))
+                x = F.relu(self.conv1(x_original, edge_index, edge_attr))
                 x = F.dropout(x, p=0.2, training=self.training)
-                x = self.conv2(x, edge_index, edge_attr)
+                x_gnn = self.conv2(x, edge_index, edge_attr)
             except RuntimeError as e:
                 print(f"ERROR en GINE de capa {layer_idx}:")
-                print(f"  x.shape: {x.shape}, device: {x.device}, dtype: {x.dtype}")
+                print(f"  x.shape: {x_original.shape}, device: {x_original.device}, dtype: {x_original.dtype}")
                 print(f"  edge_index.shape: {edge_index.shape}, num_edges: {edge_index.size(1)}")
                 print(f"  edge_attr.shape: {edge_attr.shape}")
-                print(f"  Rango de x: [{x.min().item():.4f}, {x.max().item():.4f}]")
+                print(f"  Rango de x: [{x_original.min().item():.4f}, {x_original.max().item():.4f}]")
                 print(f"  Rango de edge_attr: [{edge_attr.min().item():.4f}, {edge_attr.max().item():.4f}]")
                 raise e
             
             # Validar salida
-            if torch.isnan(x).any() or torch.isinf(x).any():
+            if torch.isnan(x_gnn).any() or torch.isinf(x_gnn).any():
                 print(f"WARNING: NaN o Inf en salida de GINE capa {layer_idx}")
-                x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+                x_gnn = torch.nan_to_num(x_gnn, nan=0.0, posinf=1e6, neginf=-1e6)
             
-            # Global pooling: un vector por grafo en el batch
-            graph_repr = global_mean_pool(x, batch)  # [batch_size, gnn_hidden]
-            layer_representations.append(graph_repr)
+            # Last Token Readout con conexión residual
+            # Identificar los índices del último token de cada grafo en el batch
+            batch_size = batch.max().item() + 1
+            last_token_indices = []
+            
+            for graph_id in range(batch_size):
+                # Encontrar todos los nodos que pertenecen a este grafo
+                node_mask = (batch == graph_id)
+                node_indices = torch.where(node_mask)[0]
+                
+                if len(node_indices) > 0:
+                    # El último índice es el último token
+                    last_token_indices.append(node_indices[-1])
+                else:
+                    # Caso extremo: si no hay nodos (no debería pasar), usar índice 0
+                    last_token_indices.append(0)
+            
+            last_token_indices = torch.tensor(last_token_indices, device=x_original.device)
+            
+            # Extraer features del último token
+            # Original: embedding antes de la GNN [batch_size, hidden_dim]
+            original_last_token = x_original[last_token_indices]
+            
+            # GNN: embedding después de la GNN [batch_size, gnn_hidden]
+            gnn_last_token = x_gnn[last_token_indices]
+            
+            # Concatenación residual: combinar información original + procesada
+            combined = torch.cat([original_last_token, gnn_last_token], dim=1)  # [batch_size, hidden_dim + gnn_hidden]
+            
+            layer_representations.append(combined)
         
         # Stack para crear secuencia temporal
-        # [batch_size, num_layers, gnn_hidden]
+        # [batch_size, num_layers, hidden_dim + gnn_hidden]
         layer_sequence = torch.stack(layer_representations, dim=1)
         
         # LSTM sobre la secuencia
@@ -320,8 +349,9 @@ class GVAELSTM(nn.Module):
         )
         
         # LSTM sobre secuencia de representaciones latentes
+        # Ahora recibe hidden_dim + latent_dim debido a la concatenación residual
         self.lstm = nn.LSTM(
-            input_size=latent_dim,
+            input_size=hidden_dim + latent_dim,
             hidden_size=lstm_hidden,
             num_layers=num_lstm_layers,
             batch_first=True,
@@ -387,8 +417,26 @@ class GVAELSTM(nn.Module):
             print(f"WARNING: NaN o Inf en salida de encoder GINE")
             x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
         
-        # Global pooling
-        graph_repr = global_mean_pool(x, batch)
+        # Last Token Readout: Seleccionar solo el último nodo de cada grafo
+        batch_size = batch.max().item() + 1
+        last_token_indices = []
+        
+        for graph_id in range(batch_size):
+            # Encontrar todos los nodos que pertenecen a este grafo
+            node_mask = (batch == graph_id)
+            node_indices = torch.where(node_mask)[0]
+            
+            if len(node_indices) > 0:
+                # El último índice es el último token
+                last_token_indices.append(node_indices[-1])
+            else:
+                # Caso extremo: si no hay nodos (no debería pasar), usar índice 0
+                last_token_indices.append(0)
+        
+        last_token_indices = torch.tensor(last_token_indices, device=x.device)
+        
+        # Extraer features del último token después de la GNN
+        graph_repr = x[last_token_indices]  # [batch_size, gnn_hidden]
         
         # Parámetros de la distribución
         mu = self.fc_mu(graph_repr)
@@ -429,15 +477,36 @@ class GVAELSTM(nn.Module):
         
         # Procesar cada capa con GVAE (usando edge_attr)
         for layer_data in batched_graphs_by_layer:
-            x, edge_index, edge_attr, batch = (
+            x_original, edge_index, edge_attr, batch = (
                 layer_data.x, 
                 layer_data.edge_index, 
                 layer_data.edge_attr,  # ← AHORA USAMOS ESTO
                 layer_data.batch
             )
             
-            # Encode (con edge features)
-            mu, logvar, graph_repr = self.encode(x, edge_index, edge_attr, batch)
+            # Extraer original_last_token ANTES de encode (sin procesar por GNN)
+            batch_size = batch.max().item() + 1
+            last_token_indices = []
+            
+            for graph_id in range(batch_size):
+                # Encontrar todos los nodos que pertenecen a este grafo
+                node_mask = (batch == graph_id)
+                node_indices = torch.where(node_mask)[0]
+                
+                if len(node_indices) > 0:
+                    # El último índice es el último token
+                    last_token_indices.append(node_indices[-1])
+                else:
+                    # Caso extremo: si no hay nodos (no debería pasar), usar índice 0
+                    last_token_indices.append(0)
+            
+            last_token_indices = torch.tensor(last_token_indices, device=x_original.device)
+            
+            # Extraer features originales del último token [batch_size, hidden_dim]
+            original_last_token = x_original[last_token_indices]
+            
+            # Encode (con edge features) -> el encoder ahora usa last token readout
+            mu, logvar, graph_repr = self.encode(x_original, edge_index, edge_attr, batch)
             
             # Reparameterize
             z = self.reparameterize(mu, logvar)
@@ -451,10 +520,13 @@ class GVAELSTM(nn.Module):
             original_reprs.append(graph_repr)
             reconstructed_reprs.append(x_reconstructed)
             
-            latent_sequence.append(z)
+            # Concatenación residual: combinar información original + latente
+            combined = torch.cat([original_last_token, z], dim=1)  # [batch_size, hidden_dim + latent_dim]
+            
+            latent_sequence.append(combined)
         
         # Secuencia latente
-        latent_seq = torch.stack(latent_sequence, dim=1)  # [batch_size, num_layers, latent_dim]
+        latent_seq = torch.stack(latent_sequence, dim=1)  # [batch_size, num_layers, hidden_dim + latent_dim]
         
         # LSTM
         lstm_out, (h_n, c_n) = self.lstm(latent_seq)
