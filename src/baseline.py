@@ -2032,7 +2032,7 @@ def run_ablation_experiments(args):
     # ========================================================================
     # EXPERIMENTO 1: LSTM Baseline
     # ========================================================================
-    if args.run_lstm:
+    if not args.skip_lstm:
         print("\n" + "="*80)
         print("EXPERIMENTO 1: LSTM-solo (Baseline)")
         print("="*80)
@@ -2081,7 +2081,7 @@ def run_ablation_experiments(args):
     # ========================================================================
     # EXPERIMENTO 2: GNN-det+LSTM
     # ========================================================================
-    if args.run_gnn_det:
+    if not args.skip_gnn_det:
         print("\n" + "="*80)
         print("EXPERIMENTO 2: GNN-det+LSTM (CHARM-style)")
         print("="*80)
@@ -2131,7 +2131,7 @@ def run_ablation_experiments(args):
     # ========================================================================
     # EXPERIMENTO 3: GVAE+LSTM
     # ========================================================================
-    if args.run_gvae:
+    if not args.skip_gvae:
         print("\n" + "="*80)
         print("EXPERIMENTO 3: GVAE+LSTM (Propuesto)")
         print("="*80)
@@ -2315,12 +2315,12 @@ if __name__ == '__main__':
                        help='Peso para pérdida KL en GVAE')
     
     # Control de experimentos
-    parser.add_argument('--run-lstm', action='store_true', default=True,
-                       help='Ejecutar experimento LSTM-solo')
-    parser.add_argument('--run-gnn-det', action='store_true', default=True,
-                       help='Ejecutar experimento GNN-det+LSTM')
-    parser.add_argument('--run-gvae', action='store_true', default=True,
-                       help='Ejecutar experimento GVAE+LSTM')
+    parser.add_argument('--skip-lstm', action='store_true', default=False,
+                       help='Saltar experimento LSTM-solo')
+    parser.add_argument('--skip-gnn-det', action='store_true', default=False,
+                       help='Saltar experimento GNN-det+LSTM')
+    parser.add_argument('--skip-gvae', action='store_true', default=False,
+                       help='Saltar experimento GVAE+LSTM')
     parser.add_argument('--output-dir', type=str, default='./ablation_results',
                        help='Directorio para guardar resultados')
     parser.add_argument('--force-cpu', action='store_true',

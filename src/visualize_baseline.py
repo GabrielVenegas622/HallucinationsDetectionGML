@@ -55,7 +55,11 @@ def extract_history(data):
         return None
     
     # Buscar el history en diferentes ubicaciones posibles
-    if 'history' in data:
+    # Estructura nueva: data['metrics']['history']
+    if 'metrics' in data and 'history' in data['metrics']:
+        return data['metrics']['history']
+    # Estructura alternativa: data['history']
+    elif 'history' in data:
         return data['history']
     elif 'training_history' in data:
         return data['training_history']
