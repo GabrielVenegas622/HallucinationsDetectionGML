@@ -1747,7 +1747,7 @@ def run_ablation_experiments(args):
         val_dataset_lstm = PreprocessedLSTMDataset(lstm_dir, batch_files_to_load=val_lstm_files, shuffle_buffer_size=0)
         test_dataset_lstm = PreprocessedLSTMDataset(lstm_dir, batch_files_to_load=test_lstm_files, shuffle_buffer_size=0)
         
-        train_dataset_gnn = PreprocessedGNNDataset(gnn_dir, batch_files_to_load=train_gnn_files, shuffle_buffer_size=1000)
+        train_dataset_gnn = PreprocessedGNNDataset(gnn_dir, batch_files_to_load=train_gnn_files, shuffle_buffer_size=100)
         val_dataset_gnn = PreprocessedGNNDataset(gnn_dir, batch_files_to_load=val_gnn_files, shuffle_buffer_size=0)
         test_dataset_gnn = PreprocessedGNNDataset(gnn_dir, batch_files_to_load=test_gnn_files, shuffle_buffer_size=0)
         
@@ -2229,7 +2229,7 @@ if __name__ == '__main__':
                        help='Learning rate')
     
     # Arquitectura
-    parser.add_argument('--gnn-hidden', type=int, default=1024,
+    parser.add_argument('--gnn-hidden', type=int, default=512,
                        help='Dimensión oculta de GNN')
     parser.add_argument('--latent-dim', type=int, default=128,
                        help='Dimensión latente para GVAE')
