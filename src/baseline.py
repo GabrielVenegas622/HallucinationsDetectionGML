@@ -25,6 +25,7 @@ Uso:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import IterableDataset
 from torch_geometric.nn import GCNConv, GINEConv, global_mean_pool
 from torch_geometric.loader import DataLoader as PyGDataLoader
 import pandas as pd
@@ -36,6 +37,8 @@ import json
 import gc
 from datetime import datetime
 from sklearn.metrics import roc_auc_score, precision_recall_curve, auc, accuracy_score, precision_score, recall_score, f1_score
+from collections import deque
+import random
 
 
 # ============================================================================
@@ -495,140 +498,250 @@ def vae_loss(recon_x, x, mu, logvar, kl_weight=0.001):
 # DATASET Y LOADERS PERSONALIZADOS
 # ============================================================================
 
-class PreprocessedLSTMDataset:
+class PreprocessedLSTMDataset(IterableDataset):
     """
-    Dataset para LSTM-solo que carga archivos preprocesados (.pt).
-    Archivos generados por preprocess_for_training.py.
+    IterableDataset para LSTM-solo con soporte para múltiples workers.
     
-    OPTIMIZADO PARA MEMORIA: Carga datos bajo demanda (lazy loading) con cache LRU.
+    ESTRATEGIA:
+    - Cada worker procesa un subconjunto de archivos .pt
+    - Lee un archivo completo, yield todas las traces, cierra y pasa al siguiente
+    - Shuffling local mediante buffer para mejorar aleatoriedad
+    - Permite paralelización real sin cargar todo en memoria
+    
+    VENTAJAS:
+    - ✅ Soporta num_workers > 0 (paralelización real)
+    - ✅ Solo 1 archivo en memoria por worker a la vez
+    - ✅ Shuffling local aceptable para datasets grandes
     """
-    def __init__(self, preprocessed_dir, max_cache_batches=2):
+    def __init__(self, preprocessed_dir, batch_files_to_load=None, shuffle_buffer_size=1000):
+        """
+        Args:
+            preprocessed_dir: Directorio con archivos preprocessed_*.pt
+            batch_files_to_load: Lista de archivos específicos a cargar (None = cargar todos)
+            shuffle_buffer_size: Tamaño del buffer para shuffling local (1000 traces ~aceptable)
+        """
+        super().__init__()
         self.preprocessed_dir = Path(preprocessed_dir)
-        self.max_cache_batches = max_cache_batches
+        self.shuffle_buffer_size = shuffle_buffer_size
         
-        # Buscar archivos de batches (patrón: preprocessed_*.pt)
-        self.batch_files = sorted(list(self.preprocessed_dir.glob('preprocessed_*.pt')))
-        if not self.batch_files:
+        # Buscar archivos de batches
+        all_batch_files = sorted(list(self.preprocessed_dir.glob('preprocessed_*.pt')))
+        if not all_batch_files:
             raise ValueError(f"No se encontraron archivos preprocessed_*.pt en {preprocessed_dir}")
         
-        print(f"Encontrados {len(self.batch_files)} archivos de batches en {preprocessed_dir}")
+        # Determinar qué archivos cargar
+        if batch_files_to_load is not None:
+            self.batch_files = [Path(f) for f in batch_files_to_load]
+        else:
+            self.batch_files = all_batch_files
         
-        # Construir índice: (batch_idx, idx_within_batch) para cada trace
-        self.index_map = []  # Lista de (batch_idx, local_idx, question_id)
-        self.total_traces = 0
+        # Contar total de traces (solo metadata, sin cargar datos)
+        print(f"📦 Escaneando {len(self.batch_files)} archivos batch (solo metadata)...")
+        self.batch_sizes = []
+        total_traces = 0
         
-        print("Construyendo índice de traces...")
-        for batch_idx, batch_file in enumerate(tqdm(self.batch_files, desc="Indexando")):
+        for batch_file in tqdm(self.batch_files, desc="Escaneando"):
             batch_data = torch.load(batch_file, weights_only=False)
-            num_traces_in_batch = len(batch_data['question_ids'])
-            for local_idx in range(num_traces_in_batch):
-                self.index_map.append((batch_idx, local_idx, batch_data['question_ids'][local_idx]))
-            self.total_traces += num_traces_in_batch
-        
-        print(f"Dataset LSTM-solo: {self.total_traces} traces en {len(self.batch_files)} batches")
-        print(f"Cache: máximo {max_cache_batches} batches en memoria simultáneamente")
-        
-        # Cache LRU para batches
-        from collections import OrderedDict
-        self.batch_cache = OrderedDict()
-    
-    def _load_batch(self, batch_idx):
-        """Carga un batch con cache LRU"""
-        if batch_idx in self.batch_cache:
-            # Mover al final (más reciente)
-            self.batch_cache.move_to_end(batch_idx)
-            return self.batch_cache[batch_idx]
-        
-        # Cargar batch
-        batch_data = torch.load(self.batch_files[batch_idx], weights_only=False)
-        
-        # Agregar al cache
-        self.batch_cache[batch_idx] = batch_data
-        
-        # Eliminar batches antiguos si excede el límite
-        while len(self.batch_cache) > self.max_cache_batches:
-            oldest_batch_idx = next(iter(self.batch_cache))
-            del self.batch_cache[oldest_batch_idx]
+            batch_size = len(batch_data['sequences'])
+            self.batch_sizes.append(batch_size)
+            total_traces += batch_size
+            del batch_data
             gc.collect()
         
-        return batch_data
+        print(f"✅ Dataset LSTM (Iterable): {total_traces} traces en {len(self.batch_files)} archivos")
+        print(f"   💾 Memoria: 1 archivo por worker (máx ~{max(self.batch_sizes)} traces)")
+        print(f"   🔀 Shuffle: Buffer local de {shuffle_buffer_size} traces")
+        print(f"   ⚡ Soporta num_workers > 0 para paralelización")
     
-    def __len__(self):
-        return self.total_traces
-    
-    def __getitem__(self, idx):
-        batch_idx, local_idx, qid = self.index_map[idx]
-        batch_data = self._load_batch(batch_idx)
+    def _get_worker_files(self):
+        """Divide archivos entre workers"""
+        worker_info = torch.utils.data.get_worker_info()
         
-        return batch_data['sequences'][local_idx], batch_data['labels'][local_idx], qid
-
-
-class PreprocessedGNNDataset:
-    """
-    Dataset para GNN-det+LSTM y GVAE que carga grafos preprocesados (.pt).
-    Archivos generados por preprocess_for_training.py.
+        if worker_info is None:
+            # Modo single-process
+            return self.batch_files
+        else:
+            # Multi-process: dividir archivos entre workers
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            
+            # Asignar archivos de manera round-robin
+            worker_files = [f for i, f in enumerate(self.batch_files) if i % num_workers == worker_id]
+            return worker_files
     
-    OPTIMIZADO PARA MEMORIA: Carga datos bajo demanda (lazy loading) con cache LRU.
+    def _shuffle_buffer(self, iterator, buffer_size):
+        """Shuffling local mediante buffer"""
+        buffer = deque(maxlen=buffer_size)
+        
+        # Llenar buffer inicial
+        for item in iterator:
+            buffer.append(item)
+            if len(buffer) == buffer_size:
+                break
+        
+        # Yield elementos aleatorios del buffer, rellenando
+        for item in iterator:
+            idx = random.randint(0, len(buffer) - 1)
+            yield buffer[idx]
+            buffer[idx] = item
+        
+        # Vaciar buffer restante
+        buffer_list = list(buffer)
+        random.shuffle(buffer_list)
+        for item in buffer_list:
+            yield item
+    
+    def _generate_samples(self):
+        """Genera samples de los archivos asignados al worker"""
+        worker_files = self._get_worker_files()
+        
+        for batch_file in worker_files:
+            # Cargar archivo completo
+            batch_data = torch.load(batch_file, weights_only=False)
+            
+            # Yield todas las traces del archivo
+            for i in range(len(batch_data['sequences'])):
+                yield (
+                    batch_data['sequences'][i],
+                    batch_data['labels'][i],
+                    batch_data['question_ids'][i]
+                )
+            
+            # Liberar memoria inmediatamente
+            del batch_data
+            gc.collect()
+    
+    def __iter__(self):
+        """Iterador con shuffling local"""
+        sample_iterator = self._generate_samples()
+        
+        if self.shuffle_buffer_size > 0:
+            sample_iterator = self._shuffle_buffer(sample_iterator, self.shuffle_buffer_size)
+        
+        return sample_iterator
+
+
+class PreprocessedGNNDataset(IterableDataset):
     """
-    def __init__(self, preprocessed_dir, max_cache_batches=2):
+    IterableDataset para GNN-det+LSTM y GVAE+LSTM con soporte para múltiples workers.
+    
+    ESTRATEGIA:
+    - Cada worker procesa un subconjunto de archivos .pt
+    - Lee un archivo completo, yield todos los grafos, cierra y pasa al siguiente
+    - Shuffling local mediante buffer para mejorar aleatoriedad
+    - Permite paralelización real sin cargar todo en memoria
+    
+    VENTAJAS:
+    - ✅ Soporta num_workers > 0 (paralelización real)
+    - ✅ Solo 1 archivo en memoria por worker a la vez
+    - ✅ Shuffling local aceptable para datasets grandes
+    """
+    def __init__(self, preprocessed_dir, batch_files_to_load=None, shuffle_buffer_size=1000):
+        """
+        Args:
+            preprocessed_dir: Directorio con archivos preprocessed_*.pt
+            batch_files_to_load: Lista de archivos específicos a cargar (None = cargar todos)
+            shuffle_buffer_size: Tamaño del buffer para shuffling local (1000 traces ~aceptable)
+        """
+        super().__init__()
         self.preprocessed_dir = Path(preprocessed_dir)
-        self.max_cache_batches = max_cache_batches
+        self.shuffle_buffer_size = shuffle_buffer_size
         
-        # Buscar archivos de batches (patrón: preprocessed_*.pt)
-        self.batch_files = sorted(list(self.preprocessed_dir.glob('preprocessed_*.pt')))
-        if not self.batch_files:
+        # Buscar archivos de batches
+        all_batch_files = sorted(list(self.preprocessed_dir.glob('preprocessed_*.pt')))
+        if not all_batch_files:
             raise ValueError(f"No se encontraron archivos preprocessed_*.pt en {preprocessed_dir}")
         
-        print(f"Encontrados {len(self.batch_files)} archivos de batches en {preprocessed_dir}")
+        # Determinar qué archivos cargar
+        if batch_files_to_load is not None:
+            self.batch_files = [Path(f) for f in batch_files_to_load]
+        else:
+            self.batch_files = all_batch_files
         
-        # Construir índice: (batch_idx, idx_within_batch) para cada trace
-        self.index_map = []  # Lista de (batch_idx, local_idx, question_id)
-        self.total_traces = 0
+        # Contar total de traces (solo metadata, sin cargar datos)
+        print(f"📦 Escaneando {len(self.batch_files)} archivos batch (solo metadata)...")
+        self.batch_sizes = []
+        total_traces = 0
         
-        print("Construyendo índice de traces...")
-        for batch_idx, batch_file in enumerate(tqdm(self.batch_files, desc="Indexando")):
+        for batch_file in tqdm(self.batch_files, desc="Escaneando"):
             batch_data = torch.load(batch_file, weights_only=False)
-            num_traces_in_batch = len(batch_data['question_ids'])
-            for local_idx in range(num_traces_in_batch):
-                self.index_map.append((batch_idx, local_idx, batch_data['question_ids'][local_idx]))
-            self.total_traces += num_traces_in_batch
-        
-        print(f"Dataset GNN: {self.total_traces} traces en {len(self.batch_files)} batches")
-        print(f"Cache: máximo {max_cache_batches} batches en memoria simultáneamente")
-        
-        # Cache LRU para batches
-        from collections import OrderedDict
-        self.batch_cache = OrderedDict()
-    
-    def _load_batch(self, batch_idx):
-        """Carga un batch con cache LRU"""
-        if batch_idx in self.batch_cache:
-            # Mover al final (más reciente)
-            self.batch_cache.move_to_end(batch_idx)
-            return self.batch_cache[batch_idx]
-        
-        # Cargar batch
-        batch_data = torch.load(self.batch_files[batch_idx], weights_only=False)
-        
-        # Agregar al cache
-        self.batch_cache[batch_idx] = batch_data
-        
-        # Eliminar batches antiguos si excede el límite
-        while len(self.batch_cache) > self.max_cache_batches:
-            oldest_batch_idx = next(iter(self.batch_cache))
-            del self.batch_cache[oldest_batch_idx]
+            batch_size = len(batch_data['graphs'])
+            self.batch_sizes.append(batch_size)
+            total_traces += batch_size
+            del batch_data
             gc.collect()
         
-        return batch_data
+        print(f"✅ Dataset GNN (Iterable): {total_traces} traces en {len(self.batch_files)} archivos")
+        print(f"   💾 Memoria: 1 archivo por worker (máx ~{max(self.batch_sizes)} traces)")
+        print(f"   🔀 Shuffle: Buffer local de {shuffle_buffer_size} traces")
+        print(f"   ⚡ Soporta num_workers > 0 para paralelización")
     
-    def __len__(self):
-        return self.total_traces
-    
-    def __getitem__(self, idx):
-        batch_idx, local_idx, qid = self.index_map[idx]
-        batch_data = self._load_batch(batch_idx)
+    def _get_worker_files(self):
+        """Divide archivos entre workers"""
+        worker_info = torch.utils.data.get_worker_info()
         
-        return batch_data['graphs'][local_idx], batch_data['labels'][local_idx], qid
+        if worker_info is None:
+            # Modo single-process
+            return self.batch_files
+        else:
+            # Multi-process: dividir archivos entre workers
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            
+            # Asignar archivos de manera round-robin
+            worker_files = [f for i, f in enumerate(self.batch_files) if i % num_workers == worker_id]
+            return worker_files
+    
+    def _shuffle_buffer(self, iterator, buffer_size):
+        """Shuffling local mediante buffer"""
+        buffer = deque(maxlen=buffer_size)
+        
+        # Llenar buffer inicial
+        for item in iterator:
+            buffer.append(item)
+            if len(buffer) == buffer_size:
+                break
+        
+        # Yield elementos aleatorios del buffer, rellenando
+        for item in iterator:
+            idx = random.randint(0, len(buffer) - 1)
+            yield buffer[idx]
+            buffer[idx] = item
+        
+        # Vaciar buffer restante
+        buffer_list = list(buffer)
+        random.shuffle(buffer_list)
+        for item in buffer_list:
+            yield item
+    
+    def _generate_samples(self):
+        """Genera samples de los archivos asignados al worker"""
+        worker_files = self._get_worker_files()
+        
+        for batch_file in worker_files:
+            # Cargar archivo completo
+            batch_data = torch.load(batch_file, weights_only=False)
+            
+            # Yield todos los grafos del archivo
+            for i in range(len(batch_data['graphs'])):
+                yield (
+                    batch_data['graphs'][i],
+                    batch_data['labels'][i],
+                    batch_data['question_ids'][i]
+                )
+            
+            # Liberar memoria inmediatamente
+            del batch_data
+            gc.collect()
+    
+    def __iter__(self):
+        """Iterador con shuffling local"""
+        sample_iterator = self._generate_samples()
+        
+        if self.shuffle_buffer_size > 0:
+            sample_iterator = self._shuffle_buffer(sample_iterator, self.shuffle_buffer_size)
+        
+        return sample_iterator
 
 
 class SequentialTraceDataset:
@@ -1575,66 +1688,80 @@ def run_ablation_experiments(args):
     # Determinar si usar datos preprocesados o raw
     use_preprocessed = hasattr(args, 'preprocessed_dir') and args.preprocessed_dir is not None
     
-    from torch.utils.data import DataLoader, random_split
+    from torch.utils.data import DataLoader
     import os
     
     if use_preprocessed:
         print(f"📦 Usando datos preprocesados desde: {args.preprocessed_dir}")
-        print(f"💾 Modo de carga: Lazy loading con cache de {args.max_cache_batches} batches")
         
-        # Para LSTM: cargar desde lstm_solo/
+        # Obtener lista de archivos batch
         lstm_dir = Path(args.preprocessed_dir) / 'lstm_solo'
-        full_dataset_lstm = PreprocessedLSTMDataset(lstm_dir, max_cache_batches=args.max_cache_batches)
-        
-        # Para GNN: cargar desde gnn/
         gnn_dir = Path(args.preprocessed_dir) / 'gnn'
-        full_dataset_gnn = PreprocessedGNNDataset(gnn_dir, max_cache_batches=args.max_cache_batches)
         
-        # Split train/val/test (mismo split para ambos)
-        total_size = len(full_dataset_lstm)
-        train_size = int(0.7 * total_size)
-        val_size = int(0.15 * total_size)
-        test_size = total_size - train_size - val_size
+        all_lstm_files = sorted(list(lstm_dir.glob('preprocessed_*.pt')))
+        all_gnn_files = sorted(list(gnn_dir.glob('preprocessed_*.pt')))
         
-        train_dataset_lstm, val_dataset_lstm, test_dataset_lstm = random_split(
-            full_dataset_lstm, [train_size, val_size, test_size],
-            generator=torch.Generator().manual_seed(42)
-        )
+        if not all_lstm_files or not all_gnn_files:
+            raise ValueError("No se encontraron archivos preprocesados")
         
-        train_dataset_gnn, val_dataset_gnn, test_dataset_gnn = random_split(
-            full_dataset_gnn, [train_size, val_size, test_size],
-            generator=torch.Generator().manual_seed(42)
-        )
+        # Split archivos a nivel de archivo (70% train, 15% val, 15% test)
+        # Esto asegura que cada subset tenga archivos completos
+        random.seed(42)
+        lstm_files_shuffled = all_lstm_files.copy()
+        gnn_files_shuffled = all_gnn_files.copy()
+        random.shuffle(lstm_files_shuffled)
+        random.shuffle(gnn_files_shuffled)
         
-        print(f"\nSplit del dataset:")
-        print(f"  Train: {len(train_dataset_lstm)}")
-        print(f"  Val: {len(val_dataset_lstm)}")
-        print(f"  Test: {len(test_dataset_lstm)}")
+        n_files = len(lstm_files_shuffled)
+        train_split = int(0.7 * n_files)
+        val_split = int(0.85 * n_files)
         
-        # Configurar num_workers
-        # IMPORTANTE: Con lazy loading, usar num_workers=0 para evitar problemas de memoria
-        # Los workers intentan cargar datos en paralelo, lo cual causa OOM con el cache LRU
-        num_workers = 0  # Desactivado para lazy loading
+        train_lstm_files = lstm_files_shuffled[:train_split]
+        val_lstm_files = lstm_files_shuffled[train_split:val_split]
+        test_lstm_files = lstm_files_shuffled[val_split:]
+        
+        train_gnn_files = gnn_files_shuffled[:train_split]
+        val_gnn_files = gnn_files_shuffled[train_split:val_split]
+        test_gnn_files = gnn_files_shuffled[val_split:]
+        
+        print(f"💾 Estrategia: IterableDataset con múltiples workers")
+        print(f"   - Archivos LSTM: {len(train_lstm_files)} train, {len(val_lstm_files)} val, {len(test_lstm_files)} test")
+        print(f"   - Archivos GNN: {len(train_gnn_files)} train, {len(val_gnn_files)} val, {len(test_gnn_files)} test")
+        print(f"   ⚡ Soporta num_workers > 0 para paralelización")
+        print(f"   🔀 Shuffling local con buffer de 1000 traces")
+        
+        # Crear datasets separados para train/val/test
+        train_dataset_lstm = PreprocessedLSTMDataset(lstm_dir, batch_files_to_load=train_lstm_files, shuffle_buffer_size=1000)
+        val_dataset_lstm = PreprocessedLSTMDataset(lstm_dir, batch_files_to_load=val_lstm_files, shuffle_buffer_size=0)
+        test_dataset_lstm = PreprocessedLSTMDataset(lstm_dir, batch_files_to_load=test_lstm_files, shuffle_buffer_size=0)
+        
+        train_dataset_gnn = PreprocessedGNNDataset(gnn_dir, batch_files_to_load=train_gnn_files, shuffle_buffer_size=1000)
+        val_dataset_gnn = PreprocessedGNNDataset(gnn_dir, batch_files_to_load=val_gnn_files, shuffle_buffer_size=0)
+        test_dataset_gnn = PreprocessedGNNDataset(gnn_dir, batch_files_to_load=test_gnn_files, shuffle_buffer_size=0)
+        
+        # Determinar num_workers óptimo
+        # Regla: num_workers = min(num_archivos_train, num_cpus, 4)
+        import multiprocessing
+        num_cpus = multiprocessing.cpu_count()
+        num_workers = min(len(train_lstm_files), num_cpus, 2)
         
         print(f"\nConfigurando DataLoaders:")
-        print(f"  - num_workers: {num_workers} (lazy loading requiere num_workers=0)")
-        print(f"  - pin_memory: True (transferencias GPU más rápidas)")
-        print(f"  ⚠️  Nota: num_workers desactivado para evitar OOM con lazy loading")
+        print(f"  - num_workers: {num_workers} (paralelización real)")
+        print(f"  - pin_memory: {device.type == 'cuda'}")
+        print(f"  - Memoria: ~{num_workers} archivos batch en memoria simultáneos")
+        print(f"  ⚡ Cada worker procesa archivos diferentes en paralelo")
         
-        # DataLoaders para LSTM
+        # DataLoaders para LSTM (sin shuffle=True porque IterableDataset ya hace shuffle interno)
         train_loader_lstm = DataLoader(
             train_dataset_lstm,
             batch_size=args.batch_size,
-            shuffle=True,
             collate_fn=collate_lstm_batch,
             num_workers=num_workers,
-            pin_memory=device.type == 'cuda',
-            persistent_workers=False
+            pin_memory=device.type == 'cuda'
         )
         val_loader_lstm = DataLoader(
             val_dataset_lstm,
             batch_size=args.batch_size,
-            shuffle=False,
             collate_fn=collate_lstm_batch,
             num_workers=num_workers,
             pin_memory=device.type == 'cuda'
@@ -1642,7 +1769,6 @@ def run_ablation_experiments(args):
         test_loader_lstm = DataLoader(
             test_dataset_lstm,
             batch_size=args.batch_size,
-            shuffle=False,
             collate_fn=collate_lstm_batch,
             num_workers=num_workers,
             pin_memory=device.type == 'cuda'
@@ -1652,16 +1778,13 @@ def run_ablation_experiments(args):
         train_loader_gnn = DataLoader(
             train_dataset_gnn,
             batch_size=args.batch_size,
-            shuffle=True,
             collate_fn=collate_gnn_batch,
             num_workers=num_workers,
-            pin_memory=device.type == 'cuda',
-            persistent_workers=False
+            pin_memory=device.type == 'cuda'
         )
         val_loader_gnn = DataLoader(
             val_dataset_gnn,
             batch_size=args.batch_size,
-            shuffle=False,
             collate_fn=collate_gnn_batch,
             num_workers=num_workers,
             pin_memory=device.type == 'cuda'
@@ -1669,16 +1792,17 @@ def run_ablation_experiments(args):
         test_loader_gnn = DataLoader(
             test_dataset_gnn,
             batch_size=args.batch_size,
-            shuffle=False,
             collate_fn=collate_gnn_batch,
             num_workers=num_workers,
             pin_memory=device.type == 'cuda'
         )
         
-        # Obtener dimensiones
-        sample_seq = full_dataset_lstm[0][0]
-        hidden_dim = sample_seq.shape[-1]
-        print(f"\nDimensión de hidden states: {hidden_dim}")
+        # Obtener dimensiones (necesitamos iterar para obtener el primer sample)
+        print("\nObteniendo dimensiones del dataset...")
+        for sample_seq, _, _ in train_dataset_lstm:
+            hidden_dim = sample_seq.shape[-1]
+            print(f"Dimensión de hidden states: {hidden_dim}")
+            break
         
     else:
         print("📂 Usando datos raw (archivos .pkl/.pkl.gz)")
@@ -1819,7 +1943,6 @@ def run_ablation_experiments(args):
         'num_lstm_layers': args.num_lstm_layers,
         'dropout': args.dropout,
         'kl_weight': args.kl_weight,
-        'max_cache_batches': args.max_cache_batches if hasattr(args, 'max_cache_batches') else None,
     }
     
     # ========================================================================
