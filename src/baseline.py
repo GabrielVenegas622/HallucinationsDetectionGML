@@ -1796,23 +1796,31 @@ def run_ablation_experiments(args):
         random.shuffle(lstm_files_shuffled)
         random.shuffle(gnn_files_shuffled)
         
-        n_files = len(lstm_files_shuffled)
-        train_split = int(0.7 * n_files)
-        val_split = int(0.85 * n_files)
+        # Usar el número de archivos de cada carpeta para el split
+        n_lstm_files = len(lstm_files_shuffled)
+        n_gnn_files = len(gnn_files_shuffled)
         
-        train_lstm_files = lstm_files_shuffled[:train_split]
-        val_lstm_files = lstm_files_shuffled[train_split:val_split]
-        test_lstm_files = lstm_files_shuffled[val_split:]
+        # Split para LSTM
+        train_split_lstm = int(0.7 * n_lstm_files)
+        val_split_lstm = int(0.85 * n_lstm_files)
         
-        train_gnn_files = gnn_files_shuffled[:train_split]
-        val_gnn_files = gnn_files_shuffled[train_split:val_split]
-        test_gnn_files = gnn_files_shuffled[val_split:]
+        train_lstm_files = lstm_files_shuffled[:train_split_lstm]
+        val_lstm_files = lstm_files_shuffled[train_split_lstm:val_split_lstm]
+        test_lstm_files = lstm_files_shuffled[val_split_lstm:]
+        
+        # Split para GNN
+        train_split_gnn = int(0.7 * n_gnn_files)
+        val_split_gnn = int(0.85 * n_gnn_files)
+        
+        train_gnn_files = gnn_files_shuffled[:train_split_gnn]
+        val_gnn_files = gnn_files_shuffled[train_split_gnn:val_split_gnn]
+        test_gnn_files = gnn_files_shuffled[val_split_gnn:]
         
         print(f"💾 Estrategia: IterableDataset con múltiples workers")
         print(f"   - Archivos LSTM: {len(train_lstm_files)} train, {len(val_lstm_files)} val, {len(test_lstm_files)} test")
         print(f"   - Archivos GNN: {len(train_gnn_files)} train, {len(val_gnn_files)} val, {len(test_gnn_files)} test")
         print(f"   ⚡ Soporta num_workers > 0 para paralelización")
-        print(f"   🔀 Shuffling local con buffer de 1000 traces")
+        print(f"   🔀 Shuffling local con buffer de 500 traces")
         
         # Crear datasets separados para train/val/test
         train_dataset_lstm = PreprocessedLSTMDataset(lstm_dir, batch_files_to_load=train_lstm_files, shuffle_buffer_size=500)
