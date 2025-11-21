@@ -952,7 +952,9 @@ class SequentialTraceDataset:
             for j in range(seq_len):
                 if i != j and attn_avg[i, j] > self.attn_threshold:
                     # i está prestando atención a j
-                    edge_list.append([i, j])
+                    # Para message passing: información fluye de j -> i
+                    # Así i puede agregar información de j (contexto)
+                    edge_list.append([j, i])
                     edge_weights.append(attn_avg[i, j].item())
         
         if edge_list:
@@ -1568,6 +1570,11 @@ def train_gvae_lstm(model, train_loader, val_loader, test_loader, device, epochs
     """
     Entrena el modelo GVAE+LSTM con clasificación binaria.
     OPTIMIZADO PARA MEMORIA: Libera memoria GPU/RAM regularmente.
+    
+    NOTA: Guarda loss separadas para comparación justa:
+    - train_task_loss: Solo loss de clasificación (comparable con otros modelos)
+    - train_vae_loss: Loss del autoencoder
+    - train_loss: Loss total (task + VAE)
     """
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -2305,21 +2312,21 @@ if __name__ == '__main__':
                        help='Número de épocas')
     parser.add_argument('--batch-size', type=int, default=16,
                        help='Tamaño del batch')
-    parser.add_argument('--lr', type=float, default=0.001,
+    parser.add_argument('--lr', type=float, default=0.005,
                        help='Learning rate')
     
     # Arquitectura
-    parser.add_argument('--gnn-hidden', type=int, default=512,
+    parser.add_argument('--gnn-hidden', type=int, default=128,
                        help='Dimensión oculta de GNN')
     parser.add_argument('--latent-dim', type=int, default=128,
                        help='Dimensión latente para GVAE')
-    parser.add_argument('--lstm-hidden', type=int, default=128,
+    parser.add_argument('--lstm-hidden', type=int, default=64,
                        help='Dimensión oculta de LSTM')
     parser.add_argument('--num-lstm-layers', type=int, default=2,
                        help='Número de capas LSTM')
     parser.add_argument('--dropout', type=float, default=0.3,
                        help='Dropout rate')
-    parser.add_argument('--kl-weight', type=float, default=0.01,
+    parser.add_argument('--kl-weight', type=float, default=0.001,
                        help='Peso para pérdida KL en GVAE')
     
     # Control de experimentos

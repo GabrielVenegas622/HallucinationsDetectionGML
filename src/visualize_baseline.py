@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
 Script para visualizar los resultados de entrenamiento de los modelos baseline.
-Genera gráficas de loss, AUROC de entrenamiento y validación para cada modelo.
+Genera gráficas de loss y AUROC de validación para cada modelo.
 
 Uso:
     python visualize_baseline.py
 
 El script busca automáticamente los archivos de resultados más recientes en:
-    - ablation_results/lstm_only_*.json
-    - ablation_results/gnn_det_lstm_*.json
-    - ablation_results/gnn_vae_lstm_*.json
+    - ablation_results/partial_lstm_solo_*.json
+    - ablation_results/partial_gnn_det_lstm_*.json
+    - ablation_results/partial_gvae_lstm_*.json
 
 Y genera las gráficas en el directorio visualizations/ con dos tipos de archivos:
     - baseline_losses_<timestamp>.png y baseline_losses_latest.png
@@ -17,6 +17,9 @@ Y genera las gráficas en el directorio visualizations/ con dos tipos de archivo
 
 El script funciona incluso si faltan algunos de los archivos de resultados,
 generando gráficas solo con los modelos disponibles.
+
+NOTA: Solo se grafican métricas de validación porque las métricas de entrenamiento
+      no se calculan durante el training (solo loss).
 """
 
 import json
@@ -69,6 +72,7 @@ def extract_history(data):
 def plot_losses(results_data, output_dir):
     """
     Genera gráficas de loss para los modelos disponibles.
+    Para GVAE, usa train_task_loss para comparación justa.
     
     Args:
         results_data: dict con keys 'lstm', 'gnn_det', 'gnn_vae' y valores que son los datos cargados
@@ -105,7 +109,12 @@ def plot_losses(results_data, output_dir):
             continue
         
         # Extraer losses
-        train_losses = history.get('train_loss', [])
+        # Para GVAE, usar train_task_loss para comparación justa (sin VAE loss)
+        if model_key == 'gnn_vae' and 'train_task_loss' in history:
+            train_losses = history.get('train_task_loss', [])
+        else:
+            train_losses = history.get('train_loss', [])
+        
         val_losses = history.get('val_loss', [])
         
         if not train_losses and not val_losses:
@@ -140,8 +149,8 @@ def plot_losses(results_data, output_dir):
     
     # Configurar subplot de train loss
     axes[0].set_xlabel('Epoch', fontsize=12)
-    axes[0].set_ylabel('Loss', fontsize=12)
-    axes[0].set_title('Training Loss', fontsize=14, fontweight='bold')
+    axes[0].set_ylabel('Task Loss', fontsize=12)
+    axes[0].set_title('Training Task Loss', fontsize=14, fontweight='bold')
     axes[0].legend(fontsize=10)
     axes[0].grid(True, alpha=0.3)
     
@@ -169,7 +178,8 @@ def plot_losses(results_data, output_dir):
 
 def plot_auroc(results_data, output_dir):
     """
-    Genera gráficas de AUROC para los modelos disponibles.
+    Genera gráfica de AUROC de validación para los modelos disponibles.
+    Nota: No se calculan métricas en train, solo en validación.
     
     Args:
         results_data: dict con keys 'lstm', 'gnn_det', 'gnn_vae' y valores que son los datos cargados
@@ -190,8 +200,8 @@ def plot_auroc(results_data, output_dir):
         'gnn_vae': 'GNN-VAE+LSTM'
     }
     
-    # Crear figura con 2 subplots (train AUROC y val AUROC)
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    # Crear figura con 1 subplot (solo val AUROC)
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
     
     has_data = False
     
@@ -203,55 +213,36 @@ def plot_auroc(results_data, output_dir):
         if history is None:
             continue
         
-        # Extraer AUROC (puede estar como 'train_auroc', 'train_auc', etc.)
-        train_auroc = history.get('train_auroc', history.get('train_auc', history.get('train_roc_auc', [])))
+        # Extraer AUROC de validación
         val_auroc = history.get('val_auroc', history.get('val_auc', history.get('val_roc_auc', [])))
         
-        if not train_auroc and not val_auroc:
-            print(f"No se encontraron datos de AUROC para {labels[model_key]}")
+        if not val_auroc:
+            print(f"No se encontraron datos de AUROC de validación para {labels[model_key]}")
             continue
         
         has_data = True
-        epochs = range(1, len(train_auroc) + 1) if train_auroc else range(1, len(val_auroc) + 1)
-        
-        # Plot train AUROC
-        if train_auroc:
-            axes[0].plot(epochs, train_auroc, 
-                        label=labels[model_key], 
-                        color=colors[model_key],
-                        linewidth=2,
-                        marker='o',
-                        markersize=3)
+        epochs = range(1, len(val_auroc) + 1)
         
         # Plot val AUROC
-        if val_auroc:
-            axes[1].plot(epochs, val_auroc, 
-                        label=labels[model_key], 
-                        color=colors[model_key],
-                        linewidth=2,
-                        marker='o',
-                        markersize=3)
+        ax.plot(epochs, val_auroc, 
+                label=labels[model_key], 
+                color=colors[model_key],
+                linewidth=2,
+                marker='o',
+                markersize=4)
     
     if not has_data:
         print("No se encontraron datos de AUROC para generar las gráficas")
         plt.close(fig)
         return
     
-    # Configurar subplot de train AUROC
-    axes[0].set_xlabel('Epoch', fontsize=12)
-    axes[0].set_ylabel('AUROC', fontsize=12)
-    axes[0].set_title('Training AUROC', fontsize=14, fontweight='bold')
-    axes[0].legend(fontsize=10)
-    axes[0].grid(True, alpha=0.3)
-    axes[0].set_ylim([0.5, 1.0])  # AUROC va de 0.5 a 1.0
-    
-    # Configurar subplot de val AUROC
-    axes[1].set_xlabel('Epoch', fontsize=12)
-    axes[1].set_ylabel('AUROC', fontsize=12)
-    axes[1].set_title('Validation AUROC', fontsize=14, fontweight='bold')
-    axes[1].legend(fontsize=10)
-    axes[1].grid(True, alpha=0.3)
-    axes[1].set_ylim([0.5, 1.0])  # AUROC va de 0.5 a 1.0
+    # Configurar plot
+    ax.set_xlabel('Epoch', fontsize=12)
+    ax.set_ylabel('AUROC', fontsize=12)
+    ax.set_title('Validation AUROC', fontsize=14, fontweight='bold')
+    ax.legend(fontsize=11, loc='lower right')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim([0.5, 1.0])  # AUROC va de 0.5 a 1.0
     
     plt.tight_layout()
     
