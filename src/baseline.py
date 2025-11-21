@@ -1823,11 +1823,11 @@ def run_ablation_experiments(args):
         print(f"   🔀 Shuffling local con buffer de 500 traces")
         
         # Crear datasets separados para train/val/test
-        train_dataset_lstm = PreprocessedLSTMDataset(lstm_dir, batch_files_to_load=train_lstm_files, shuffle_buffer_size=500)
+        train_dataset_lstm = PreprocessedLSTMDataset(lstm_dir, batch_files_to_load=train_lstm_files, shuffle_buffer_size=250)
         val_dataset_lstm = PreprocessedLSTMDataset(lstm_dir, batch_files_to_load=val_lstm_files, shuffle_buffer_size=0)
         test_dataset_lstm = PreprocessedLSTMDataset(lstm_dir, batch_files_to_load=test_lstm_files, shuffle_buffer_size=0)
         
-        train_dataset_gnn = PreprocessedGNNDataset(gnn_dir, batch_files_to_load=train_gnn_files, shuffle_buffer_size=500)
+        train_dataset_gnn = PreprocessedGNNDataset(gnn_dir, batch_files_to_load=train_gnn_files, shuffle_buffer_size=250)
         val_dataset_gnn = PreprocessedGNNDataset(gnn_dir, batch_files_to_load=val_gnn_files, shuffle_buffer_size=0)
         test_dataset_gnn = PreprocessedGNNDataset(gnn_dir, batch_files_to_load=test_gnn_files, shuffle_buffer_size=0)
         
@@ -1835,7 +1835,7 @@ def run_ablation_experiments(args):
         # Regla: num_workers = min(num_archivos_train, num_cpus, 4)
         import multiprocessing
         num_cpus = multiprocessing.cpu_count()
-        num_workers = min(len(train_lstm_files), num_cpus, 4)
+        num_workers = min(len(train_lstm_files), num_cpus, 2)
         
         print(f"\nConfigurando DataLoaders:")
         print(f"  - num_workers: {num_workers} (paralelización real)")
