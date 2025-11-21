@@ -2,6 +2,7 @@
 """
 Script para dividir archivos .pt grandes en partes más pequeñas.
 Divide archivos con 250 traces en 5 sub-archivos de 50 traces cada uno.
+Soporta tanto archivos GNN (con 'graphs') como LSTM-solo (con 'sequences').
 """
 
 import argparse
@@ -15,6 +16,7 @@ import gc
 def divide_batch_file(input_path: Path, output_dir: Path, traces_per_part: int = 50):
     """
     Divide un archivo .pt con múltiples traces en partes más pequeñas.
+    Detecta automáticamente si es un archivo GNN o LSTM-solo.
     
     Args:
         input_path: Ruta al archivo de entrada
@@ -24,40 +26,62 @@ def divide_batch_file(input_path: Path, output_dir: Path, traces_per_part: int =
     # Cargar el archivo
     batch_data = torch.load(input_path, weights_only=False)
     
-    # Validar estructura
-    required_keys = ['graphs', 'labels', 'question_ids']
+    # Detectar tipo de archivo
+    is_lstm_solo = 'sequences' in batch_data
+    is_gnn = 'graphs' in batch_data
+    
+    if not is_lstm_solo and not is_gnn:
+        raise ValueError(f"Archivo {input_path} no contiene ni 'sequences' ni 'graphs'")
+    
+    # Validar estructura común
+    required_keys = ['labels', 'question_ids']
     for key in required_keys:
         if key not in batch_data:
             raise ValueError(f"Archivo {input_path} no contiene la clave '{key}'")
     
-    graphs = batch_data['graphs']
+    # Obtener datos según el tipo
+    if is_lstm_solo:
+        data_key = 'sequences'
+        sequences = batch_data['sequences']
+        num_traces = sequences.shape[0]  # [num_traces, num_layers, hidden_dim]
+    else:  # is_gnn
+        data_key = 'graphs'
+        graphs = batch_data['graphs']
+        num_traces = len(graphs)
+    
     labels = batch_data['labels']
     question_ids = batch_data['question_ids']
     
     # Validar que tengan la misma longitud
-    num_traces = len(graphs)
     if len(labels) != num_traces or len(question_ids) != num_traces:
         raise ValueError(f"Longitudes inconsistentes en {input_path}: "
-                         f"graphs={len(graphs)}, labels={len(labels)}, "
+                         f"{data_key}={num_traces}, labels={len(labels)}, "
                          f"question_ids={len(question_ids)}")
     
     # Calcular número de partes
     num_parts = (num_traces + traces_per_part - 1) // traces_per_part
     
     # Extraer nombre base del archivo (sin extensión)
-    base_name = input_path.stem  # Ejemplo: preprocessed_llama2_chat_7B_triviaqa_batch_0000_sub0000
+    base_name = input_path.stem
     
     # Dividir y guardar
     for part_idx in range(num_parts):
         start_idx = part_idx * traces_per_part
         end_idx = min(start_idx + traces_per_part, num_traces)
         
-        # Slice sincronizado
-        part_data = {
-            'graphs': graphs[start_idx:end_idx],
-            'labels': labels[start_idx:end_idx],
-            'question_ids': question_ids[start_idx:end_idx]
-        }
+        # Slice sincronizado según el tipo
+        if is_lstm_solo:
+            part_data = {
+                'sequences': sequences[start_idx:end_idx],
+                'labels': labels[start_idx:end_idx],
+                'question_ids': question_ids[start_idx:end_idx]
+            }
+        else:  # is_gnn
+            part_data = {
+                'graphs': graphs[start_idx:end_idx],
+                'labels': labels[start_idx:end_idx],
+                'question_ids': question_ids[start_idx:end_idx]
+            }
         
         # Nombre del archivo de salida
         output_name = f"{base_name}_part{part_idx}.pt"
@@ -67,7 +91,12 @@ def divide_batch_file(input_path: Path, output_dir: Path, traces_per_part: int =
         torch.save(part_data, output_path)
     
     # Liberar memoria
-    del batch_data, graphs, labels, question_ids
+    del batch_data
+    if is_lstm_solo:
+        del sequences
+    else:
+        del graphs
+    del labels, question_ids
     gc.collect()
     
     return num_parts
