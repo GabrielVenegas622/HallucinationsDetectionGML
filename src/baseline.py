@@ -143,6 +143,7 @@ class GNNDetLSTM(nn.Module):
             ),
             edge_dim=1  # edge_attr es 1-dimensional (valor de atención)
         )
+        self.bn1 = nn.BatchNorm1d(gnn_hidden)
         
         self.conv2 = GINEConv(
             nn.Sequential(
@@ -152,6 +153,7 @@ class GNNDetLSTM(nn.Module):
             ),
             edge_dim=1
         )
+        self.bn2 = nn.BatchNorm1d(gnn_hidden)
         
         # LSTM sobre la secuencia de representaciones de grafos
         # Ahora recibe hidden_dim + gnn_hidden debido a la concatenación residual
@@ -225,16 +227,23 @@ class GNNDetLSTM(nn.Module):
             
             # GINE encoding: propaga información considerando pesos de atención
             try:
-                x = F.relu(self.conv1(x_original, edge_index, edge_attr))
+                # Capa 1: GINE -> BatchNorm -> ReLU -> Dropout
+                x = self.conv1(x_original, edge_index, edge_attr)
+                x = self.bn1(x)
+                x = F.relu(x)
                 x = F.dropout(x, p=0.2, training=self.training)
+
+                # Capa 2: GINE -> BatchNorm
                 x_gnn = self.conv2(x, edge_index, edge_attr)
+                x_gnn = self.bn2(x_gnn)
             except RuntimeError as e:
                 print(f"ERROR en GINE de capa {layer_idx}:")
                 print(f"  x.shape: {x_original.shape}, device: {x_original.device}, dtype: {x_original.dtype}")
                 print(f"  edge_index.shape: {edge_index.shape}, num_edges: {edge_index.size(1)}")
                 print(f"  edge_attr.shape: {edge_attr.shape}")
                 print(f"  Rango de x: [{x_original.min().item():.4f}, {x_original.max().item():.4f}]")
-                print(f"  Rango de edge_attr: [{edge_attr.min().item():.4f}, {edge_attr.max().item():.4f}]")
+                if edge_attr.numel() > 0:
+                    print(f"  Rango de edge_attr: [{edge_attr.min().item():.4f}, {edge_attr.max().item():.4f}]")
                 raise e
             
             # Validar salida
@@ -305,7 +314,7 @@ class GVAELSTM(nn.Module):
     Pipeline:
     1. Para cada capa: GVAE encoder (con edge features) → distribución latente z ~ N(μ, σ²)
     2. Sampling de z (reparameterization trick)
-    3. Secuencia de z's → LSTM
+    3. Secuencia de [original_last_token, μ, logvar] → LSTM (Two-Stage)
     4. Clasificación + pérdida de reconstrucción (regularización)
     
     La incertidumbre capturada puede ayudar a detectar alucinaciones.
@@ -327,6 +336,7 @@ class GVAELSTM(nn.Module):
             ),
             edge_dim=1  # edge_attr es 1-dimensional (valor de atención)
         )
+        self.bn1 = nn.BatchNorm1d(gnn_hidden)
         
         self.conv2 = GINEConv(
             nn.Sequential(
@@ -336,6 +346,7 @@ class GVAELSTM(nn.Module):
             ),
             edge_dim=1
         )
+        self.bn2 = nn.BatchNorm1d(gnn_hidden)
         
         # Proyecciones a parámetros de la distribución latente
         self.fc_mu = nn.Linear(gnn_hidden, latent_dim)
@@ -349,9 +360,9 @@ class GVAELSTM(nn.Module):
         )
         
         # LSTM sobre secuencia de representaciones latentes
-        # Ahora recibe hidden_dim + latent_dim debido a la concatenación residual
+        # Two-Stage: La entrada es determinista [original_last_token, mu, logvar]
         self.lstm = nn.LSTM(
-            input_size=hidden_dim + latent_dim,
+            input_size=hidden_dim + latent_dim * 2,
             hidden_size=lstm_hidden,
             num_layers=num_lstm_layers,
             batch_first=True,
@@ -402,9 +413,16 @@ class GVAELSTM(nn.Module):
         
         # GINE: usa edge features (pesos de atención)
         try:
-            x = F.relu(self.conv1(x, edge_index, edge_attr))
-            x = F.dropout(x, p=0.2, training=self.training)
-            x = self.conv2(x, edge_index, edge_attr)
+            # Capa 1: GINE -> BatchNorm -> ReLU -> Dropout
+            x_conv = self.conv1(x, edge_index, edge_attr)
+            x_conv = self.bn1(x_conv)
+            x_conv = F.relu(x_conv)
+            x_conv = F.dropout(x_conv, p=0.2, training=self.training)
+            
+            # Capa 2: GINE -> BatchNorm
+            x_conv = self.conv2(x_conv, edge_index, edge_attr)
+            x_conv = self.bn2(x_conv)
+
         except RuntimeError as e:
             print(f"ERROR en GINE encoder:")
             print(f"  x.shape: {x.shape}, device: {x.device}")
@@ -413,9 +431,9 @@ class GVAELSTM(nn.Module):
             raise e
         
         # Validar salida
-        if torch.isnan(x).any() or torch.isinf(x).any():
+        if torch.isnan(x_conv).any() or torch.isinf(x_conv).any():
             print(f"WARNING: NaN o Inf en salida de encoder GINE")
-            x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+            x_conv = torch.nan_to_num(x_conv, nan=0.0, posinf=1e6, neginf=-1e6)
         
         # Last Token Readout: Seleccionar solo el último nodo de cada grafo
         batch_size = batch.max().item() + 1
@@ -436,7 +454,7 @@ class GVAELSTM(nn.Module):
         last_token_indices = torch.tensor(last_token_indices, device=x.device)
         
         # Extraer features del último token después de la GNN
-        graph_repr = x[last_token_indices]  # [batch_size, gnn_hidden]
+        graph_repr = x_conv[last_token_indices]  # [batch_size, gnn_hidden]
         
         # Parámetros de la distribución
         mu = self.fc_mu(graph_repr)
@@ -480,7 +498,7 @@ class GVAELSTM(nn.Module):
             x_original, edge_index, edge_attr, batch = (
                 layer_data.x, 
                 layer_data.edge_index, 
-                layer_data.edge_attr,  # ← AHORA USAMOS ESTO
+                layer_data.edge_attr,
                 layer_data.batch
             )
             
@@ -508,7 +526,7 @@ class GVAELSTM(nn.Module):
             # Encode (con edge features) -> el encoder ahora usa last token readout
             mu, logvar, graph_repr = self.encode(x_original, edge_index, edge_attr, batch)
             
-            # Reparameterize
+            # Reparameterize (SOLO para el decoder)
             z = self.reparameterize(mu, logvar)
             
             # Decode (para pérdida de reconstrucción)
@@ -520,13 +538,13 @@ class GVAELSTM(nn.Module):
             original_reprs.append(graph_repr)
             reconstructed_reprs.append(x_reconstructed)
             
-            # Concatenación residual: combinar información original + latente
-            combined = torch.cat([original_last_token, z], dim=1)  # [batch_size, hidden_dim + latent_dim]
+            # Two-Stage: Concatenar info original + mu + logvar para el LSTM
+            combined = torch.cat([original_last_token, mu, logvar], dim=1)
             
             latent_sequence.append(combined)
         
         # Secuencia latente
-        latent_seq = torch.stack(latent_sequence, dim=1)  # [batch_size, num_layers, hidden_dim + latent_dim]
+        latent_seq = torch.stack(latent_sequence, dim=1)
         
         # LSTM
         lstm_out, (h_n, c_n) = self.lstm(latent_seq)
