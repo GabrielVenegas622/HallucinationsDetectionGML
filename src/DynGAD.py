@@ -265,18 +265,18 @@ def evaluate_model(model, data_loader, device, threshold=0.5):
             'recall': recall_score(all_labels, preds, zero_division=0),
             'f1': f1_score(all_labels, preds, zero_division=0)}
 
-def train_model(model, train_loader, val_loader, test_loader, device, args):
-    model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+def train_model(model, optimizer, train_loader, val_loader, device, args, output_dir, start_epoch, best_val_auroc, best_threshold, history):
+    model.to(device)
     criterion = nn.BCEWithLogitsLoss()
-    history = {}
-    best_val_auroc = 0.0
     
-    for epoch in range(args.epochs):
+    epochs_no_improve = 0
+    
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         total_loss, total_task_loss, total_aux_loss = 0, 0, 0
         
-        for batched_by_layer, labels, _ in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        for i, (batched_by_layer, labels, _) in enumerate(progress_bar):
             if batched_by_layer is None: continue
             labels = labels.to(device).unsqueeze(1)
             batched_by_layer_gpu = [d.to(device) for d in batched_by_layer]
@@ -294,10 +294,17 @@ def train_model(model, train_loader, val_loader, test_loader, device, args):
             total_task_loss += task_loss.item()
             total_aux_loss += aux_loss.item()
             
+            progress_bar.set_postfix({
+                'loss': total_loss / (i + 1),
+                'task': total_task_loss / (i + 1),
+                'aux': total_aux_loss / (i + 1)
+            })
+            
             del loss, task_loss, aux_loss, logits, labels; gc.collect(); torch.cuda.empty_cache()
 
         # Validation
         val_probs, val_labels = [], []
+        model.eval()
         with torch.no_grad():
             for batched_by_layer, labels, _ in val_loader:
                 if batched_by_layer is None: continue
@@ -309,30 +316,60 @@ def train_model(model, train_loader, val_loader, test_loader, device, args):
         optimal_threshold = find_optimal_threshold(val_labels, val_probs)
         val_metrics = evaluate_model(model, val_loader, device, threshold=optimal_threshold)
         
-        print(f"Epoch {epoch+1}: Train Loss={total_loss/len(train_loader):.4f} (Task={total_task_loss/len(train_loader):.4f}, Aux={total_aux_loss/len(train_loader):.4f}), "
+        avg_train_loss = total_loss / len(train_loader) if len(train_loader) > 0 else 0
+        avg_task_loss = total_task_loss / len(train_loader) if len(train_loader) > 0 else 0
+        avg_aux_loss = total_aux_loss / len(train_loader) if len(train_loader) > 0 else 0
+
+        print(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.4f} (Task={avg_task_loss:.4f}, Aux={avg_aux_loss:.4f}), "
               f"Val AUROC={val_metrics['auroc']:.4f}, Val F1={val_metrics['f1']:.4f} (thr={optimal_threshold:.3f})")
         
+        history[epoch] = {
+            'train_loss': avg_train_loss,
+            'train_task_loss': avg_task_loss,
+            'train_aux_loss': avg_aux_loss,
+            'val_metrics': val_metrics,
+            'optimal_threshold': optimal_threshold
+        }
+
+        # Guardado del mejor modelo
         if val_metrics['auroc'] > best_val_auroc:
             best_val_auroc = val_metrics['auroc']
             best_threshold = optimal_threshold
-            torch.save(model.state_dict(), 'best_GraphSequenceClassifier.pt')
+            epochs_no_improve = 0
+            torch.save(model.state_dict(), output_dir / 'best_model.pt')
             print(f"  -> New best model saved with AUROC: {best_val_auroc:.4f}")
+        else:
+            epochs_no_improve += 1
 
-    # Final Test
-    print("\n" + "="*80 + "\nEVALUACIÓN FINAL EN TEST\n" + "="*80)
-    model.load_state_dict(torch.load('best_GraphSequenceClassifier.pt'))
-    test_metrics = evaluate_model(model, test_loader, device, threshold=best_threshold)
-    print(f"\nMetrics en TEST (threshold={best_threshold:.3f}):")
-    for metric, value in test_metrics.items(): print(f"  {metric.capitalize()}: {value:.4f}")
-    history['test_metrics'] = test_metrics
-    return history
+        # Checkpoint de la época actual
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'best_val_auroc': best_val_auroc,
+            'best_threshold': best_threshold,
+            'history': history
+        }
+        torch.save(checkpoint, output_dir / 'latest_checkpoint.pt')
+
+        # Early Stopping
+        if epochs_no_improve >= args.patience:
+            print(f"\nEarly stopping triggered after {args.patience} epochs with no improvement.")
+            break
+            
+    return history, best_threshold
 
 def run_experiment(args):
     print("="*80 + "\nEntrenamiento del Modelo GraphSequenceClassifier\n" + "="*80)
     device = torch.device('cuda' if torch.cuda.is_available() and not args.force_cpu else 'cpu')
-    print(f"\nDispositivo: {device}")
+    print(f"Dispositivo: {device}")
     if device.type == 'cuda': torch.cuda.empty_cache()
 
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(exist_ok=True)
+    print(f"Resultados se guardarán en: {output_dir.resolve()}")
+
+    # --- Carga de Datos ---
     gnn_dir = Path(args.preprocessed_dir) / 'gnn'
     all_files = sorted(list(gnn_dir.glob('preprocessed_*.pt')))
     random.seed(42); random.shuffle(all_files)
@@ -347,21 +384,68 @@ def run_experiment(args):
     hidden_dim = next(iter(train_loader))[0][0].x.shape[-1]
     print(f"Dimensión de hidden states: {hidden_dim}")
 
+    # --- Inicialización del Modelo y Optimizador ---
     model = GraphSequenceClassifier(hidden_dim=hidden_dim, gnn_hidden=args.gnn_hidden, latent_dim=args.latent_dim,
                                     lstm_hidden=args.lstm_hidden, num_lstm_layers=args.num_lstm_layers, dropout=args.dropout)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+
+    # --- Lógica para Reanudar Entrenamiento ---
+    start_epoch = 0
+    best_val_auroc = 0.0
+    best_threshold = 0.5
+    history = {}
+    checkpoint_path = output_dir / 'latest_checkpoint.pt'
+
+    if args.resume and checkpoint_path.exists():
+        print(f"Reanudando entrenamiento desde {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_auroc = checkpoint['best_val_auroc']
+        best_threshold = checkpoint.get('best_threshold', 0.5)
+        history = checkpoint['history']
+        model.to(device)
+        print(f"Reanudado desde la época {start_epoch}. Mejor Val AUROC hasta ahora: {best_val_auroc:.4f}")
+    else:
+        print("Iniciando nueva sesión de entrenamiento.")
+
+    # --- Entrenamiento ---
+    history, final_best_threshold = train_model(
+        model, optimizer, train_loader, val_loader, device, args,
+        output_dir, start_epoch, best_val_auroc, best_threshold, history
+    )
     
-    history = train_model(model, train_loader, val_loader, test_loader, device, args)
-    
-    output_dir = Path(args.output_dir); output_dir.mkdir(exist_ok=True)
+    # --- Evaluación Final en Test ---
+    print("\n" + "="*80 + "\nEVALUACIÓN FINAL EN TEST\n" + "="*80)
+    best_model_path = output_dir / 'best_model.pt'
+    if best_model_path.exists():
+        model.load_state_dict(torch.load(best_model_path, map_location=device))
+        test_metrics = evaluate_model(model, test_loader, device, threshold=final_best_threshold)
+        
+        print(f"Métricas en TEST (threshold={final_best_threshold:.3f}):")
+        for metric, value in test_metrics.items():
+            print(f"  {metric.capitalize()}: {value:.4f}")
+        
+        history['final_test_metrics'] = test_metrics
+        history['final_best_threshold'] = final_best_threshold
+    else:
+        print("No se encontró el mejor modelo ('best_model.pt'). Saltando evaluación final.")
+        history['final_test_metrics'] = "Skipped"
+
+    # --- Guardado de Resultados ---
     results_file = output_dir / f'GraphSequenceClassifier_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+    # Convertir tensores y otros objetos no serializables
+    serializable_history = json.loads(json.dumps(history, default=lambda o: float(o) if isinstance(o, (np.float32, np.float64)) else str(o)))
+    
     with open(results_file, 'w') as f:
-        json.dump(json.loads(json.dumps(history, default=lambda o: o.__dict__)), f, indent=4)
-    print(f"\nResultados guardados en: {results_file}")
+        json.dump(serializable_history, f, indent=4)
+    print(f"\nResultados finales guardados en: {results_file}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Entrenar GraphSequenceClassifier.")
     parser.add_argument('--preprocessed-dir', type=str, required=True, help='Directorio con datos preprocesados ("gnn")')
-    parser.add_argument('--output-dir', type=str, default='ablation_results', help='Directorio para guardar resultados')
+    parser.add_argument('--output-dir', type=str, default='dyngad_results', help='Directorio para guardar checkpoints y resultados')
     parser.add_argument('--gnn-hidden', type=int, default=128)
     parser.add_argument('--latent-dim', type=int, default=128)
     parser.add_argument('--lstm-hidden', type=int, default=256)
@@ -371,6 +455,8 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size (reducir si hay problemas de memoria)')
     parser.add_argument('--lr', type=float, default=0.0005)
     parser.add_argument('--aux-loss-weight', type=float, default=1.0, help='Peso para la pérdida auxiliar combinada')
+    parser.add_argument('--patience', type=int, default=10, help='Paciencia para Early Stopping')
+    parser.add_argument('--resume', action='store_true', help='Indica si se debe reanudar el entrenamiento desde el último checkpoint')
     parser.add_argument('--force-cpu', action='store_true')
     
     args = parser.parse_args()
