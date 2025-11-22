@@ -130,82 +130,90 @@ class GraphSequenceClassifier(torch.nn.Module):
         lstm_inputs = []
         total_aux_loss = 0.0
         
-        # Obtener el dtype del modelo de un parámetro para garantizar la consistencia
-        model_dtype = next(self.parameters()).dtype
-
         # Procesar cada grafo de la secuencia temporal
-        for layer_data in batched_graphs_by_layer:
+        for layer_idx, layer_data in enumerate(batched_graphs_by_layer):
             x, edge_index, edge_attr, batch = layer_data.x, layer_data.edge_index, layer_data.edge_attr, layer_data.batch
 
-            # Forzar la consistencia del dtype para evitar errores de precisión mixta
-            x = x.to(model_dtype)
-            if edge_attr is not None:
-                edge_attr = edge_attr.to(model_dtype)
+            # --- Saneamiento de datos portado de baseline.py ---
+            x = x.float()
+            if torch.isnan(x).any() or torch.isinf(x).any():
+                print(f"WARNING: NaN o Inf detectado en x de capa {layer_idx}")
+                x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+
+            if edge_attr is not None and edge_attr.numel() > 0:
+                edge_attr = edge_attr.float()
+                if torch.isnan(edge_attr).any() or torch.isinf(edge_attr).any():
+                    print(f"WARNING: NaN o Inf detectado en edge_attr de capa {layer_idx}")
+                    edge_attr = torch.nan_to_num(edge_attr, nan=0.0, posinf=1.0, neginf=0.0)
+                
+                if edge_attr.dim() == 1:
+                    edge_attr = edge_attr.unsqueeze(1)
+                
+                if edge_attr.size(0) != edge_index.size(1):
+                    print(f"WARNING: Mismatch en capa {layer_idx}: edge_attr={edge_attr.size(0)}, edges={edge_index.size(1)}")
+                    num_edges = edge_index.size(1)
+                    if edge_attr.size(0) > num_edges:
+                        edge_attr = edge_attr[:num_edges]
+                    else:
+                        padding = torch.zeros((num_edges - edge_attr.size(0), 1), 
+                                            dtype=edge_attr.dtype, device=edge_attr.device)
+                        edge_attr = torch.cat([edge_attr, padding], dim=0)
+                
+                edge_attr = torch.clamp(edge_attr, min=0.0, max=1.0)
+            else:
+                num_edges = edge_index.size(1)
+                edge_attr = torch.zeros((num_edges, 1), dtype=torch.float, device=x.device)
+            # --- Fin del saneamiento de datos ---
 
             # 1. Encoder GINE
-            x_gnn = self.conv1(x, edge_index, edge_attr)
-            x_gnn = self.bn1(x_gnn)
-            x_gnn = F.relu(x_gnn)
-            
-            x_gnn = self.conv2(x_gnn, edge_index, edge_attr)
-            x_gnn = self.bn2(x_gnn)
+            try:
+                x_gnn = self.conv1(x, edge_index, edge_attr)
+                x_gnn = self.bn1(x_gnn)
+                x_gnn = F.relu(x_gnn)
+                
+                x_gnn = self.conv2(x_gnn, edge_index, edge_attr)
+                x_gnn = self.bn2(x_gnn)
+            except RuntimeError as e:
+                print(f"ERROR en GINE de capa {layer_idx}:")
+                print(f"  x.shape: {x.shape}, device: {x.device}, dtype: {x.dtype}")
+                print(f"  edge_index.shape: {edge_index.shape}, num_edges: {edge_index.size(1)}")
+                print(f"  edge_attr.shape: {edge_attr.shape}")
+                if x.numel() > 0: print(f"  Rango de x: [{x.min().item():.4f}, {x.max().item():.4f}]")
+                if edge_attr.numel() > 0: print(f"  Rango de edge_attr: [{edge_attr.min().item():.4f}, {edge_attr.max().item():.4f}]")
+                raise e
 
             # 2. Conversión a formato Denso para MincutPool
-            # Shape x_dense: [batch_size, max_nodes, gnn_hidden]
-            # Shape mask: [batch_size, max_nodes]
             x_dense, mask = to_dense_batch(x_gnn, batch, max_num_nodes=200)
-            
-            # Shape adj: [batch_size, max_nodes, max_nodes]
             adj = to_dense_adj(edge_index, batch, max_num_nodes=200)
 
             # 3. Pooling Jerárquico (dense_mincut_pool)
-            # Aprender la matriz de asignación de clusters
-            s = self.pool_mlp(x_dense) # Shape s: [batch_size, max_nodes, num_clusters]
-
-            # Aplicar pooling
-            # Shape x_pooled: [batch_size, num_clusters, gnn_hidden]
-            # Shape adj_pooled: [batch_size, num_clusters, num_clusters]
+            s = self.pool_mlp(x_dense)
             x_pooled, adj_pooled, mc_loss, o_loss = dense_mincut_pool(x_dense, adj, s, mask)
 
             # 4. Proyección a espacio latente
-            # Aplanar la salida del pooling para obtener un único vector por grafo
-            # Shape graph_repr: [batch_size, num_clusters * gnn_hidden]
             graph_repr = x_pooled.flatten(start_dim=1)
-            
             mu = self.fc_mu(graph_repr)
             log_std = self.fc_log_std(graph_repr)
 
             # 5. Calcular pérdidas auxiliares del VAE
             z = self.reparameterize(mu, log_std)
-            
-            # Reconstrucción de la matriz de adyacencia agrupada
             adj_recons_flat = self.decoder(z)
             adj_recons = adj_recons_flat.view(-1, self.num_clusters, self.num_clusters)
             recon_loss = F.mse_loss(adj_recons, adj_pooled, reduction='mean')
-
-            # Divergencia KL (analítica)
             kl_loss = 0.5 * torch.mean(torch.exp(2 * log_std) + mu.pow(2) - 1. - (2 * log_std))
-            
-            # Sumar todas las pérdidas auxiliares de esta capa
             total_aux_loss += mc_loss + o_loss + kl_loss + recon_loss
 
             # 6. Preparar entrada para el LSTM (determinista)
-            # Shape lstm_input: [batch_size, latent_dim * 2]
             lstm_input = torch.cat([mu, log_std], dim=-1)
             lstm_inputs.append(lstm_input)
 
         # 7. Procesamiento Temporal con LSTM
-        # Shape lstm_sequence: [batch_size, num_layers, latent_dim * 2]
         lstm_sequence = torch.stack(lstm_inputs, dim=1)
-        
         lstm_out, (h_n, c_n) = self.lstm(lstm_sequence)
-        
-        # Usar el último estado oculto (concatenado de ambas direcciones)
-        # Shape final_hidden: [batch_size, lstm_hidden * 2]
         final_hidden = torch.cat([h_n[-2], h_n[-1]], dim=1)
 
         # 8. Clasificación final para obtener logits
-        logits = self.classifier(final_hidden) # Shape: [batch_size, 1]
+        logits = self.classifier(final_hidden)
         
         return logits, total_aux_loss / len(batched_graphs_by_layer)
 
@@ -400,7 +408,7 @@ def run_experiment(args):
 
     # --- Inicialización del Modelo y Optimizador ---
     model = GraphSequenceClassifier(hidden_dim=hidden_dim, gnn_hidden=args.gnn_hidden, latent_dim=args.latent_dim,
-                                    lstm_hidden=args.lstm_hidden, num_lstm_layers=args.num_lstm_layers, dropout=args.dropout)
+                                    lstm_hidden=args.lstm_hidden, num_lstm_layers=args.num_lstm_layers, dropout=args.dropout).float()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
 
     # --- Lógica para Reanudar Entrenamiento ---
