@@ -310,6 +310,8 @@ def train_model(model, optimizer, train_loader, val_loader, device, args, output
             loss = task_loss + args.aux_loss_weight * aux_loss
             
             loss.backward()
+            # Gradient Clipping: Vital para evitar explosión cuando la incertidumbre es alta
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
             total_loss += loss.item()
@@ -476,7 +478,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size (reducir si hay problemas de memoria)')
     parser.add_argument('--lr', type=float, default=0.0005)
-    parser.add_argument('--aux-loss-weight', type=float, default=1.0, help='Peso para la pérdida auxiliar combinada')
+    parser.add_argument('--aux-loss-weight', type=float, default=0.01, help='Peso para la pérdida auxiliar combinada')
     parser.add_argument('--patience', type=int, default=20, help='Paciencia para Early Stopping')
     parser.add_argument('--resume', action='store_true', help='Indica si se debe reanudar el entrenamiento desde el último checkpoint')
     parser.add_argument('--force-cpu', action='store_true')
