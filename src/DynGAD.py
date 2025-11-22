@@ -130,9 +130,17 @@ class GraphSequenceClassifier(torch.nn.Module):
         lstm_inputs = []
         total_aux_loss = 0.0
         
+        # Obtener el dtype del modelo de un parámetro para garantizar la consistencia
+        model_dtype = next(self.parameters()).dtype
+
         # Procesar cada grafo de la secuencia temporal
         for layer_data in batched_graphs_by_layer:
             x, edge_index, edge_attr, batch = layer_data.x, layer_data.edge_index, layer_data.edge_attr, layer_data.batch
+
+            # Forzar la consistencia del dtype para evitar errores de precisión mixta
+            x = x.to(model_dtype)
+            if edge_attr is not None:
+                edge_attr = edge_attr.to(model_dtype)
 
             # 1. Encoder GINE
             x_gnn = self.conv1(x, edge_index, edge_attr)
