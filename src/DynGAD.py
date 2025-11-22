@@ -216,7 +216,7 @@ class PreprocessedGNNDataset(IterableDataset):
         self.batch_files = all_files if batch_files_to_load is None else [Path(f) for f in batch_files_to_load]
         
         print(f"📦 Escaneando {len(self.batch_files)} archivos batch...")
-        total_traces = sum(len(torch.load(f, map_location='cpu')['graphs']) for f in tqdm(self.batch_files, desc="Escaneando"))
+        total_traces = sum(len(torch.load(f, map_location='cpu', weights_only=False)['graphs']) for f in tqdm(self.batch_files, desc="Escaneando"))
         self.total_traces = total_traces
         print(f"✅ Dataset GNN (Iterable): {total_traces} traces en {len(self.batch_files)} archivos")
 
@@ -226,7 +226,7 @@ class PreprocessedGNNDataset(IterableDataset):
         return self.batch_files if worker_info is None else [f for i, f in enumerate(self.batch_files) if i % worker_info.num_workers == worker_info.id]
     def _generate_samples(self):
         for batch_file in self._get_worker_files():
-            batch_data = torch.load(batch_file, map_location='cpu')
+            batch_data = torch.load(batch_file, map_location='cpu', weights_only=False)
             for i in range(len(batch_data['graphs'])):
                 yield (batch_data['graphs'][i], batch_data['labels'][i], batch_data['question_ids'][i])
             del batch_data; gc.collect()
