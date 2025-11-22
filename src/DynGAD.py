@@ -73,10 +73,12 @@ class GraphSequenceClassifier(torch.nn.Module):
             nn.Sequential(nn.Linear(hidden_dim, gnn_hidden), nn.ReLU(), nn.Linear(gnn_hidden, gnn_hidden)),
             edge_dim=1
         )
+        self.bn1 = nn.BatchNorm1d(gnn_hidden)
         self.conv2 = GINEConv(
             nn.Sequential(nn.Linear(gnn_hidden, gnn_hidden), nn.ReLU(), nn.Linear(gnn_hidden, gnn_hidden)),
             edge_dim=1
         )
+        self.bn2 = nn.BatchNorm1d(gnn_hidden)
 
         # Componente 1: MLP para aprender la asignación de clusters en MincutPool
         self.pool_mlp = nn.Linear(self.gnn_hidden, self.num_clusters)
@@ -133,8 +135,12 @@ class GraphSequenceClassifier(torch.nn.Module):
             x, edge_index, edge_attr, batch = layer_data.x, layer_data.edge_index, layer_data.edge_attr, layer_data.batch
 
             # 1. Encoder GINE
-            x_gnn = F.relu(self.conv1(x, edge_index, edge_attr))
+            x_gnn = self.conv1(x, edge_index, edge_attr)
+            x_gnn = self.bn1(x_gnn)
+            x_gnn = F.relu(x_gnn)
+            
             x_gnn = self.conv2(x_gnn, edge_index, edge_attr)
+            x_gnn = self.bn2(x_gnn)
 
             # 2. Conversión a formato Denso para MincutPool
             # Shape x_dense: [batch_size, max_nodes, gnn_hidden]
@@ -398,7 +404,7 @@ def run_experiment(args):
 
     if args.resume and checkpoint_path.exists():
         print(f"Reanudando entrenamiento desde {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
@@ -420,7 +426,7 @@ def run_experiment(args):
     print("\n" + "="*80 + "\nEVALUACIÓN FINAL EN TEST\n" + "="*80)
     best_model_path = output_dir / 'best_model.pt'
     if best_model_path.exists():
-        model.load_state_dict(torch.load(best_model_path, map_location=device))
+        model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
         test_metrics = evaluate_model(model, test_loader, device, threshold=final_best_threshold)
         
         print(f"Métricas en TEST (threshold={final_best_threshold:.3f}):")
@@ -448,14 +454,14 @@ if __name__ == '__main__':
     parser.add_argument('--output-dir', type=str, default='dyngad_results', help='Directorio para guardar checkpoints y resultados')
     parser.add_argument('--gnn-hidden', type=int, default=128)
     parser.add_argument('--latent-dim', type=int, default=128)
-    parser.add_argument('--lstm-hidden', type=int, default=256)
+    parser.add_argument('--lstm-hidden', type=int, default=128)
     parser.add_argument('--num-lstm-layers', type=int, default=2)
     parser.add_argument('--dropout', type=float, default=0.3)
-    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size (reducir si hay problemas de memoria)')
     parser.add_argument('--lr', type=float, default=0.0005)
     parser.add_argument('--aux-loss-weight', type=float, default=1.0, help='Peso para la pérdida auxiliar combinada')
-    parser.add_argument('--patience', type=int, default=10, help='Paciencia para Early Stopping')
+    parser.add_argument('--patience', type=int, default=20, help='Paciencia para Early Stopping')
     parser.add_argument('--resume', action='store_true', help='Indica si se debe reanudar el entrenamiento desde el último checkpoint')
     parser.add_argument('--force-cpu', action='store_true')
     
