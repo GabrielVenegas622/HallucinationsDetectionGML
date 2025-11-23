@@ -90,11 +90,9 @@ class GraphSequenceClassifier(torch.nn.Module):
         self.fc_log_std = nn.Linear(pooled_dim, self.latent_dim)
 
         # Componente 2: Decoder para VAE (reconstrucción de adyacencia)
-        self.decoder = nn.Sequential(
-            nn.Linear(self.latent_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, self.num_clusters * self.num_clusters)
-        )
+        # Se elimina el decoder MLP. La reconstrucción se hará con producto punto.
+        if self.latent_dim % self.num_clusters != 0:
+            raise ValueError("latent_dim must be divisible by num_clusters for inner product decoding.")
 
         # Componente 3: Procesamiento Temporal (LSTM)
         # La entrada es determinista: [mu, log_std]
@@ -199,8 +197,12 @@ class GraphSequenceClassifier(torch.nn.Module):
 
             # 5. Calcular pérdidas auxiliares del VAE
             z = self.reparameterize(mu, log_std)
-            adj_recons_flat = self.decoder(z)
-            adj_recons = adj_recons_flat.view(-1, self.num_clusters, self.num_clusters)
+            
+            # Inner Product Decoder
+            z_reshaped = z.view(-1, self.num_clusters, self.latent_dim // self.num_clusters)
+            adj_recons = torch.bmm(z_reshaped, z_reshaped.transpose(1, 2))
+            adj_recons = torch.sigmoid(adj_recons)
+
             recon_loss = F.mse_loss(adj_recons, adj_pooled, reduction='mean')
             kl_loss = 0.5 * torch.mean(torch.exp(2 * log_std) + mu.pow(2) - 1. - (2 * log_std))
             
