@@ -61,12 +61,12 @@ class GraphSequenceClassifier(torch.nn.Module):
     """
     Arquitectura GINE-VAE-LSTM para clasificación binaria de secuencias de grafos.
     """
-    def __init__(self, hidden_dim, gnn_hidden=128, latent_dim=128, lstm_hidden=256, num_lstm_layers=2, dropout=0.3):
+    def __init__(self, hidden_dim, gnn_hidden=128, latent_dim=128, lstm_hidden=256, num_lstm_layers=2, dropout=0.3, num_clusters=32):
         super().__init__()
         
         self.gnn_hidden = gnn_hidden
         self.latent_dim = latent_dim
-        self.num_clusters = 32  # Especificación: 32 clusters para MincutPool
+        self.num_clusters = num_clusters
 
         # Componente 1: Encoder Estructural (GINE)
         self.conv1 = GINEConv(
@@ -410,7 +410,8 @@ def run_experiment(args):
 
     # --- Inicialización del Modelo y Optimizador ---
     model = GraphSequenceClassifier(hidden_dim=hidden_dim, gnn_hidden=args.gnn_hidden, latent_dim=args.latent_dim,
-                                    lstm_hidden=args.lstm_hidden, num_lstm_layers=args.num_lstm_layers, dropout=args.dropout).float()
+                                    lstm_hidden=args.lstm_hidden, num_lstm_layers=args.num_lstm_layers, dropout=args.dropout,
+                                    num_clusters=args.num_clusters).float()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
 
     # --- Lógica para Reanudar Entrenamiento ---
@@ -470,9 +471,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Entrenar GraphSequenceClassifier.")
     parser.add_argument('--preprocessed-dir', type=str, required=True, help='Directorio con datos preprocesados ("gnn")')
     parser.add_argument('--output-dir', type=str, default='dyngad_results', help='Directorio para guardar checkpoints y resultados')
+    parser.add_argument('--num-clusters', type=int, default=32, help='Número de clusters para MincutPool en el VAE.')
     parser.add_argument('--gnn-hidden', type=int, default=128)
     parser.add_argument('--latent-dim', type=int, default=64)
-    parser.add_argument('--lstm-hidden', type=int, default=64)
+    parser.add_argument('--lstm-hidden', type=int, default=32)
     parser.add_argument('--num-lstm-layers', type=int, default=2)
     parser.add_argument('--dropout', type=float, default=0.3)
     parser.add_argument('--epochs', type=int, default=500)
