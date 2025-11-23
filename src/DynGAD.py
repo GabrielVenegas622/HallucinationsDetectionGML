@@ -193,7 +193,7 @@ class GraphSequenceClassifier(torch.nn.Module):
             # 4. Proyección a espacio latente
             graph_repr = x_pooled.flatten(start_dim=1)
             mu = self.fc_mu(graph_repr)
-            log_std = self.fc_log_std(graph_repr)
+            log_std = 10.0 * torch.tanh(self.fc_log_std(graph_repr))
 
             # 5. Calcular pérdidas auxiliares del VAE
             z = self.reparameterize(mu, log_std)
@@ -531,7 +531,7 @@ if __name__ == '__main__':
     parser.add_argument('--dropout', type=float, default=0.5)
     parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size (reducir si hay problemas de memoria)')
-    parser.add_argument('--lr', type=float, default=0.0005)
+    parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--aux-loss-weight', type=float, default=0.5, help='Peso para la pérdida auxiliar combinada')
     parser.add_argument('--patience', type=int, default=50, help='Paciencia para Early Stopping')
     parser.add_argument('--resume', action='store_true', help='Indica si se debe reanudar el entrenamiento desde el último checkpoint')
