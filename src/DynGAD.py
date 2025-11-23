@@ -292,7 +292,8 @@ def train_model(model, optimizer, train_loader, val_loader, device, args, output
     criterion = nn.BCEWithLogitsLoss()
     
     epochs_no_improve = 0
-    
+    last_val_metrics = { 'loss': 0.0, 'auroc': 0.0 }
+
     for epoch in range(start_epoch, args.epochs):
         model.train()
         total_loss, total_task_loss, total_aux_loss = 0, 0, 0
@@ -319,41 +320,68 @@ def train_model(model, optimizer, train_loader, val_loader, device, args, output
             total_aux_loss += aux_loss.item()
             
             progress_bar.set_postfix({
-                'loss': total_loss / (i + 1),
-                'task': total_task_loss / (i + 1),
-                'aux': total_aux_loss / (i + 1)
+                'loss': f"{total_loss / (i + 1):.4f}",
+                'val_loss': f"{last_val_metrics['loss']:.4f}",
+                'val_auroc': f"{last_val_metrics['auroc']:.4f}"
             })
             
             del loss, task_loss, aux_loss, logits, labels; gc.collect(); torch.cuda.empty_cache()
 
         # Validation
         val_probs, val_labels = [], []
+        total_val_loss, total_val_task_loss, total_val_aux_loss = 0.0, 0.0, 0.0
         model.eval()
         with torch.no_grad():
             for batched_by_layer, labels, _ in val_loader:
                 if batched_by_layer is None: continue
                 batched_by_layer_gpu = [d.to(device) for d in batched_by_layer]
-                logits, _ = model(batched_by_layer_gpu)
+                labels_gpu = labels.to(device).unsqueeze(1)
+                
+                logits, aux_loss_val = model(batched_by_layer_gpu)
+                
+                task_loss_val = criterion(logits, labels_gpu)
+                loss_val = task_loss_val + args.aux_loss_weight * aux_loss_val
+                
+                total_val_loss += loss_val.item()
+                total_val_task_loss += task_loss_val.item()
+                total_val_aux_loss += aux_loss_val.item()
+
                 val_probs.extend(torch.sigmoid(logits).cpu().numpy().flatten())
                 val_labels.extend(labels.numpy().flatten())
+
+        avg_val_loss = total_val_loss / len(val_loader) if len(val_loader) > 0 else 0
+        avg_val_task_loss = total_val_task_loss / len(val_loader) if len(val_loader) > 0 else 0
+        avg_val_aux_loss = total_val_aux_loss / len(val_loader) if len(val_loader) > 0 else 0
+
+        val_probs_np, val_labels_np = np.array(val_probs), np.array(val_labels)
+        optimal_threshold = find_optimal_threshold(val_labels_np, val_probs_np)
         
-        optimal_threshold = find_optimal_threshold(val_labels, val_probs)
-        val_metrics = evaluate_model(model, val_loader, device, threshold=optimal_threshold)
+        if len(val_labels_np) == 0:
+            val_metrics = {m: 0 for m in ['auroc', 'accuracy', 'precision', 'recall', 'f1']}
+        else:
+            preds = (val_probs_np > optimal_threshold).astype(float)
+            val_metrics = {
+                'auroc': roc_auc_score(val_labels_np, val_probs_np) if len(np.unique(val_labels_np)) > 1 else 0.5,
+                'accuracy': accuracy_score(val_labels_np, preds),
+                'precision': precision_score(val_labels_np, preds, zero_division=0),
+                'recall': recall_score(val_labels_np, preds, zero_division=0),
+                'f1': f1_score(val_labels_np, preds, zero_division=0)
+            }
         
         avg_train_loss = total_loss / len(train_loader) if len(train_loader) > 0 else 0
         avg_task_loss = total_task_loss / len(train_loader) if len(train_loader) > 0 else 0
         avg_aux_loss = total_aux_loss / len(train_loader) if len(train_loader) > 0 else 0
 
-        print(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.4f} (Task={avg_task_loss:.4f}, Aux={avg_aux_loss:.4f}), "
+        print(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.4f}, Val Loss={avg_val_loss:.4f}, "
               f"Val AUROC={val_metrics['auroc']:.4f}, Val F1={val_metrics['f1']:.4f} (thr={optimal_threshold:.3f})")
         
         history[epoch] = {
-            'train_loss': avg_train_loss,
-            'train_task_loss': avg_task_loss,
-            'train_aux_loss': avg_aux_loss,
-            'val_metrics': val_metrics,
-            'optimal_threshold': optimal_threshold
+            'train_loss': avg_train_loss, 'train_task_loss': avg_task_loss, 'train_aux_loss': avg_aux_loss,
+            'val_loss': avg_val_loss, 'val_task_loss': avg_val_task_loss, 'val_aux_loss': avg_val_aux_loss,
+            'val_metrics': val_metrics, 'optimal_threshold': optimal_threshold
         }
+
+        last_val_metrics = {'loss': avg_val_loss, 'auroc': val_metrics['auroc']}
 
         # Guardado del mejor modelo
         if val_metrics['auroc'] > best_val_auroc:
@@ -471,12 +499,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Entrenar GraphSequenceClassifier.")
     parser.add_argument('--preprocessed-dir', type=str, required=True, help='Directorio con datos preprocesados ("gnn")')
     parser.add_argument('--output-dir', type=str, default='dyngad_results', help='Directorio para guardar checkpoints y resultados')
-    parser.add_argument('--num-clusters', type=int, default=32, help='Número de clusters para MincutPool en el VAE.')
-    parser.add_argument('--gnn-hidden', type=int, default=128)
-    parser.add_argument('--latent-dim', type=int, default=64)
+    parser.add_argument('--num-clusters', type=int, default=16, help='Número de clusters para MincutPool en el VAE.')
+    parser.add_argument('--gnn-hidden', type=int, default=256)
+    parser.add_argument('--latent-dim', type=int, default=128)
     parser.add_argument('--lstm-hidden', type=int, default=32)
     parser.add_argument('--num-lstm-layers', type=int, default=2)
-    parser.add_argument('--dropout', type=float, default=0.3)
+    parser.add_argument('--dropout', type=float, default=0.5)
     parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size (reducir si hay problemas de memoria)')
     parser.add_argument('--lr', type=float, default=0.0005)
