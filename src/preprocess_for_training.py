@@ -1,6 +1,6 @@
 import pickle
 import numpy as np
-from sklearn.decomposition import TruncatedSVD
+from sklearn.decomposition import IncrementalPCA
 from pathlib import Path
 import torch
 from torch_geometric.data import Data
@@ -14,7 +14,6 @@ import gzip
 # --- Configuration ---
 SVD_COMPONENTS = 64
 SHARD_SIZE = 2000  # Number of traces per shard file
-SVD_FIT_MEM_LIMIT_GB = 9
 TOP_K_PERCENTILE = 0.35
 
 def get_all_pkl_files(input_dir):
@@ -28,22 +27,33 @@ def get_all_pkl_files(input_dir):
     print(f"Found {len(files)} .pkl/.pkl.gz files to process.")
     return files
 
-def fit_svd_on_sample(files, memory_limit_gb):
+def fit_reducer_on_sample(all_files, num_files_str):
     """
-    Samples embeddings from .pkl files up to a memory limit, then fits a
-    TruncatedSVD model on them.
+    Samples a number of files, loads all their embeddings, and fits an
+    IncrementalPCA model in batches to show progress.
     """
-    print(f"--- Phase 1: Calibrating SVD (Memory Limit: ~{memory_limit_gb}GB) ---")
-    memory_limit_bytes = memory_limit_gb * 1024**3
-    
+    print(f"--- Phase 1: Calibrating Dimensionality Reducer ---")
+
+    if num_files_str.lower() == 'all':
+        files_to_sample = all_files
+        print(f"Using all {len(all_files)} files to fit PCA.")
+        print("Warning: This may consume a large amount of memory.")
+    else:
+        try:
+            num_files = int(num_files_str)
+            if num_files <= 0:
+                raise ValueError("Number of files must be positive.")
+            if num_files > len(all_files):
+                print(f"Warning: Requested {num_files} files, but only {len(all_files)} are available. Using all files.")
+                num_files = len(all_files)
+            
+            files_to_sample = random.sample(all_files, k=num_files)
+            print(f"Randomly sampling {num_files} files to fit PCA.")
+        except ValueError:
+            raise ValueError(f"Invalid value for --pca-fit-files: '{num_files_str}'. Must be an integer or 'all'.")
+
     all_embeddings = []
-    current_size = 0
-    files_sampled_count = 0
-
-    # Shuffle files to get a more representative sample if we hit the memory limit early
-    random.shuffle(files)
-
-    for pkl_file in tqdm(files, desc="Sampling embeddings for SVD"):
+    for pkl_file in tqdm(files_to_sample, desc="Loading embeddings for PCA"):
         try:
             if pkl_file.suffix == '.gz':
                 with gzip.open(pkl_file, 'rb') as f:
@@ -51,40 +61,37 @@ def fit_svd_on_sample(files, memory_limit_gb):
             else:
                 with open(pkl_file, 'rb') as f:
                     data = pickle.load(f)
-            files_sampled_count += 1
             
             for trace_dict in data:
                 for layer_embedding in trace_dict['hidden_states']:
                     if layer_embedding is not None and layer_embedding.shape[0] > 0:
                         all_embeddings.append(layer_embedding)
-                        current_size += layer_embedding.nbytes
-                
-                if current_size >= memory_limit_bytes:
-                    break
-            if current_size >= memory_limit_bytes:
-                break
         except Exception as e:
             print(f"Warning: Could not read or process {pkl_file}: {e}")
-            
-    if not all_embeddings:
-        raise ValueError("Could not sample any embeddings. Check input files.")
 
-    print(f"Sampled from {files_sampled_count} files.")
-    print(f"Collected {len(all_embeddings)} embedding matrices, total size {current_size / 1024**3:.2f} GB.")
+    if not all_embeddings:
+        raise ValueError("Could not load any embeddings from the selected files.")
     
     concatenated_embeddings = np.concatenate(all_embeddings, axis=0)
     del all_embeddings; gc.collect()
-
-    print(f"Fitting TruncatedSVD on matrix of shape {concatenated_embeddings.shape}")
-    svd = TruncatedSVD(n_components=SVD_COMPONENTS, random_state=42)
-    svd.fit(concatenated_embeddings)
     
-    explained_variance = svd.explained_variance_ratio_.sum()
-    print(f"SVD FITTED. Total explained variance by {SVD_COMPONENTS} components: {explained_variance:.4f}")
-    
-    return svd
+    print(f"Fitting IncrementalPCA on matrix of shape {concatenated_embeddings.shape}...")
+    print("Note: This can be slow. Using IncrementalPCA to show progress.")
 
-def process_trace(trace, svd_transformer):
+    reducer = IncrementalPCA(n_components=SVD_COMPONENTS)
+    
+    # Use a reasonable batch size for partial fitting. This can be tuned.
+    batch_size = 50000 
+
+    for i in tqdm(range(0, concatenated_embeddings.shape[0], batch_size), desc="Fitting PCA in batches"):
+        reducer.partial_fit(concatenated_embeddings[i:i + batch_size])
+        
+    explained_variance = reducer.explained_variance_ratio_.sum()
+    print(f"PCA fitted. Total explained variance by {SVD_COMPONENTS} components: {explained_variance:.4f}")
+    
+    return reducer
+
+def process_trace(trace, reducer):
     """
     Processes a single raw trace:
     1. Applies SVD to node embeddings.
@@ -101,7 +108,7 @@ def process_trace(trace, svd_transformer):
             num_nodes = layer_embedding.shape[0]
             
             # Apply SVD transformation
-            x = svd_transformer.transform(layer_embedding)
+            x = reducer.transform(layer_embedding)
             x = torch.tensor(x, dtype=torch.float32)
             
             # Prune edges dynamically based on attention
@@ -162,8 +169,8 @@ def main(args):
     output_path = Path(args.output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # --- Phase 1: SVD Calibration ---
-    svd_transformer = fit_svd_on_sample(input_files, SVD_FIT_MEM_LIMIT_GB)
+    # --- Phase 1: Reducer Calibration ---
+    reducer = fit_reducer_on_sample(input_files, args.pca_fit_files)
 
     # --- Phase 2: Processing and Sharding ---
     print("\n--- Phase 2: Processing and Sharding Data ---")
@@ -190,7 +197,7 @@ def main(args):
                 # Create the trace format expected by process_trace
                 raw_trace = list(zip(trace_dict['hidden_states'], raw_attentions))
 
-                processed_graphs = process_trace(raw_trace, svd_transformer)
+                processed_graphs = process_trace(raw_trace, reducer)
                 
                 accumulator.append({
                     'graphs': processed_graphs,
@@ -221,6 +228,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Preprocess trace data with SVD and sharding.")
     parser.add_argument('--input-dir', type=str, required=True, help='Directory containing raw .pkl trace files.')
     parser.add_argument('--output-dir', type=str, required=True, help='Directory to save the processed .pt shard files.')
+    parser.add_argument(
+        '--pca-fit-files',
+        type=str,
+        default='20',
+        help="Number of files to use for fitting PCA. Use 'all' to use all files. (default: 20)"
+    )
     
     args = parser.parse_args()
     main(args)
