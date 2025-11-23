@@ -9,6 +9,7 @@ from tqdm import tqdm
 import argparse
 import sys
 import gc
+import gzip
 
 # --- Configuration ---
 SVD_COMPONENTS = 64
@@ -17,14 +18,14 @@ SVD_FIT_MEM_LIMIT_GB = 9
 TOP_K_PERCENTILE = 0.35
 
 def get_all_pkl_files(input_dir):
-    """Finds all .pkl files in the input directory."""
+    """Finds all .pkl and .pkl.gz files in the input directory."""
     input_path = Path(input_dir)
     if not input_path.is_dir():
         raise NotADirectoryError(f"Input path is not a directory: {input_dir}")
-    files = list(input_path.glob('*.pkl'))
+    files = list(input_path.glob('*.pkl')) + list(input_path.glob('*.pkl.gz'))
     if not files:
-        raise FileNotFoundError(f"No .pkl files found in {input_dir}")
-    print(f"Found {len(files)} .pkl files to process.")
+        raise FileNotFoundError(f"No .pkl or .pkl.gz files found in {input_dir}")
+    print(f"Found {len(files)} .pkl/.pkl.gz files to process.")
     return files
 
 def fit_svd_on_sample(files, memory_limit_gb):
@@ -44,8 +45,12 @@ def fit_svd_on_sample(files, memory_limit_gb):
 
     for pkl_file in tqdm(files, desc="Sampling embeddings for SVD"):
         try:
-            with open(pkl_file, 'rb') as f:
-                data = pickle.load(f)
+            if pkl_file.suffix == '.gz':
+                with gzip.open(pkl_file, 'rb') as f:
+                    data = pickle.load(f)
+            else:
+                with open(pkl_file, 'rb') as f:
+                    data = pickle.load(f)
             files_sampled_count += 1
             
             for trace in data.get('traces', []):
@@ -170,8 +175,12 @@ def main(args):
     progress_bar = tqdm(total=len(input_files), desc="Processing files")
     for pkl_file in input_files:
         try:
-            with open(pkl_file, 'rb') as f:
-                data = pickle.load(f)
+            if pkl_file.suffix == '.gz':
+                with gzip.open(pkl_file, 'rb') as f:
+                    data = pickle.load(f)
+            else:
+                with open(pkl_file, 'rb') as f:
+                    data = pickle.load(f)
             
             traces = data['traces']
             labels = data['labels']
