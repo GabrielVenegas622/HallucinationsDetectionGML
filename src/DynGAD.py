@@ -68,9 +68,17 @@ class GraphSequenceClassifier(torch.nn.Module):
         self.latent_dim = latent_dim
         self.num_clusters = num_clusters
 
+        # Proyección de entrada para regularización y suavizado
+        self.input_proj = nn.Sequential(
+            nn.Linear(hidden_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+
         # Componente 1: Encoder Estructural (GINE)
         self.conv1 = GINEConv(
-            nn.Sequential(nn.Linear(hidden_dim, gnn_hidden), nn.ReLU(), nn.Linear(gnn_hidden, gnn_hidden)),
+            nn.Sequential(nn.Linear(512, gnn_hidden), nn.ReLU(), nn.Linear(gnn_hidden, gnn_hidden)),
             edge_dim=1
         )
         self.bn1 = nn.BatchNorm1d(gnn_hidden)
@@ -107,7 +115,10 @@ class GraphSequenceClassifier(torch.nn.Module):
         )
 
         # Componente 4: Clasificador de Salida
-        self.classifier = nn.Linear(lstm_hidden * 2, 1)
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(lstm_hidden * 2, 1)
+        )
 
     def reparameterize(self, mu, log_std):
         """Reparameterization trick: z = μ + σ * ε"""
@@ -138,6 +149,9 @@ class GraphSequenceClassifier(torch.nn.Module):
             if torch.isnan(x).any() or torch.isinf(x).any():
                 print(f"WARNING: NaN o Inf detectado en x de capa {layer_idx}")
                 x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+
+            # Proyección de entrada
+            x = self.input_proj(x)
 
             if edge_attr is not None and edge_attr.numel() > 0:
                 edge_attr = edge_attr.float()
@@ -300,7 +314,7 @@ def evaluate_model(model, data_loader, device, threshold=0.5):
             'recall': recall_score(all_labels, preds, zero_division=0),
             'f1': f1_score(all_labels, preds, zero_division=0)}
 
-def train_model(model, optimizer, train_loader, val_loader, device, args, output_dir, start_epoch, best_val_auroc, best_threshold, history):
+def train_model(model, optimizer, train_loader, val_loader, device, args, output_dir, start_epoch, best_val_auroc, best_threshold, history, results_file):
     model.to(device)
     criterion = nn.BCEWithLogitsLoss()
     
@@ -432,6 +446,11 @@ def train_model(model, optimizer, train_loader, val_loader, device, args, output
         }
         torch.save(checkpoint, output_dir / 'latest_checkpoint.pt')
 
+        # Guardado incremental
+        serializable_history = json.loads(json.dumps(history, default=lambda o: float(o) if isinstance(o, (np.float32, np.float64)) else str(o)))
+        with open(results_file, 'w') as f:
+            json.dump(serializable_history, f, indent=4)
+
         # Early Stopping
         if epochs_no_improve >= args.patience:
             print(f"\nEarly stopping triggered after {args.patience} epochs with no improvement.")
@@ -492,9 +511,10 @@ def run_experiment(args):
         print("Iniciando nueva sesión de entrenamiento.")
 
     # --- Entrenamiento ---
+    results_file = output_dir / f'GraphSequenceClassifier_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
     history, final_best_threshold = train_model(
         model, optimizer, train_loader, val_loader, device, args,
-        output_dir, start_epoch, best_val_auroc, best_threshold, history
+        output_dir, start_epoch, best_val_auroc, best_threshold, history, results_file
     )
     
     # --- Evaluación Final en Test ---
@@ -508,19 +528,18 @@ def run_experiment(args):
         for metric, value in test_metrics.items():
             print(f"  {metric.capitalize()}: {value:.4f}")
         
+        # Guardado final con métricas de test
         history['final_test_metrics'] = test_metrics
         history['final_best_threshold'] = final_best_threshold
+        serializable_history = json.loads(json.dumps(history, default=lambda o: float(o) if isinstance(o, (np.float32, np.float64)) else str(o)))
+        with open(results_file, 'w') as f:
+            json.dump(serializable_history, f, indent=4)
+        print(f"\nResultados finales guardados en: {results_file}")
     else:
         print("No se encontró el mejor modelo ('best_model.pt'). Saltando evaluación final.")
         history['final_test_metrics'] = "Skipped"
 
     # --- Guardado de Resultados ---
-    results_file = output_dir / f'GraphSequenceClassifier_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
-    # Convertir tensores y otros objetos no serializables
-    serializable_history = json.loads(json.dumps(history, default=lambda o: float(o) if isinstance(o, (np.float32, np.float64)) else str(o)))
-    
-    with open(results_file, 'w') as f:
-        json.dump(serializable_history, f, indent=4)
     print(f"\nResultados finales guardados en: {results_file}")
 
 if __name__ == '__main__':
