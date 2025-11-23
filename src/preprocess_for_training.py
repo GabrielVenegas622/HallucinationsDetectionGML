@@ -53,8 +53,8 @@ def fit_svd_on_sample(files, memory_limit_gb):
                     data = pickle.load(f)
             files_sampled_count += 1
             
-            for trace in data.get('traces', []):
-                for layer_embedding, _ in trace:
+            for trace_dict in data:
+                for layer_embedding in trace_dict['hidden_states']:
                     if layer_embedding is not None and layer_embedding.shape[0] > 0:
                         all_embeddings.append(layer_embedding)
                         current_size += layer_embedding.nbytes
@@ -144,14 +144,13 @@ def save_shard(shard_data, output_dir, shard_num):
     
     # Unzip from list of dicts to dict of lists
     graphs = [item['graphs'] for item in shard_data]
-    labels = torch.tensor([item['label'] for item in shard_data], dtype=torch.float32)
     question_ids = [item['question_id'] for item in shard_data]
     
     save_path = Path(output_dir) / f'sharded_data_part_{shard_num}.pt'
     
+    # Labels are not processed in this script. They should be added in a later step.
     torch.save({
         'graphs': graphs,
-        'labels': labels,
         'question_ids': question_ids
     }, save_path)
     print(f"Shard {shard_num} saved to {save_path}")
@@ -182,17 +181,22 @@ def main(args):
                 with open(pkl_file, 'rb') as f:
                     data = pickle.load(f)
             
-            traces = data['traces']
-            labels = data['labels']
-            qids = data['question_ids']
+            # The loaded data is a list of trace dictionaries
+            for trace_dict in data:
+                question_id = trace_dict['question_id']
+                
+                # Average attention heads to get a 2D matrix per layer
+                raw_attentions = [attn.mean(axis=0) for attn in trace_dict['attentions']]
+                # Create the trace format expected by process_trace
+                raw_trace = list(zip(trace_dict['hidden_states'], raw_attentions))
 
-            for i in range(len(traces)):
-                processed_graphs = process_trace(traces[i], svd_transformer)
+                processed_graphs = process_trace(raw_trace, svd_transformer)
                 
                 accumulator.append({
-                    'graphs': processed_graphs, 
-                    'label': labels[i], 
-                    'question_id': qids[i]
+                    'graphs': processed_graphs,
+                    'question_id': question_id
+                    # Note: Labels are not included as they are not in the source .pkl files.
+                    # They should be added in a separate step if needed.
                 })
                 
                 # Check if the accumulator is full
