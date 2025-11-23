@@ -85,6 +85,7 @@ class GraphSequenceClassifier(torch.nn.Module):
 
         # Componente 1: Proyección a espacio latente
         pooled_dim = self.gnn_hidden * self.num_clusters
+        self.pre_vae_bn = nn.BatchNorm1d(pooled_dim)
         self.fc_mu = nn.Linear(pooled_dim, self.latent_dim)
         self.fc_log_std = nn.Linear(pooled_dim, self.latent_dim)
 
@@ -192,6 +193,7 @@ class GraphSequenceClassifier(torch.nn.Module):
 
             # 4. Proyección a espacio latente
             graph_repr = x_pooled.flatten(start_dim=1)
+            graph_repr = self.pre_vae_bn(graph_repr)
             mu = self.fc_mu(graph_repr)
             log_std = 10.0 * torch.tanh(self.fc_log_std(graph_repr))
 
@@ -464,7 +466,7 @@ def run_experiment(args):
     model = GraphSequenceClassifier(hidden_dim=hidden_dim, gnn_hidden=args.gnn_hidden, latent_dim=args.latent_dim,
                                     lstm_hidden=args.lstm_hidden, num_lstm_layers=args.num_lstm_layers, dropout=args.dropout,
                                     num_clusters=args.num_clusters).float()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-3)
 
     # --- Lógica para Reanudar Entrenamiento ---
     start_epoch = 0
