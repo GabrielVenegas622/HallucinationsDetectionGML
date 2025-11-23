@@ -201,7 +201,16 @@ class GraphSequenceClassifier(torch.nn.Module):
             adj_recons = adj_recons_flat.view(-1, self.num_clusters, self.num_clusters)
             recon_loss = F.mse_loss(adj_recons, adj_pooled, reduction='mean')
             kl_loss = 0.5 * torch.mean(torch.exp(2 * log_std) + mu.pow(2) - 1. - (2 * log_std))
-            total_aux_loss += mc_loss + o_loss + kl_loss + recon_loss
+            
+            layer_aux_loss = mc_loss + o_loss + kl_loss + recon_loss
+            if torch.isnan(layer_aux_loss):
+                print(f"\nWARNING: NaN detected in aux_loss at layer {layer_idx}")
+                print(f"  mc_loss: {mc_loss.item():.4f}, o_loss: {o_loss.item():.4f}, kl_loss: {kl_loss.item():.4f}, recon_loss: {recon_loss.item():.4f}")
+                print(f"  mu stats: mean={mu.mean().item():.4f}, std={mu.std().item():.4f}, min={mu.min().item():.4f}, max={mu.max().item():.4f}")
+                print(f"  log_std stats: mean={log_std.mean().item():.4f}, std={log_std.std().item():.4f}, min={log_std.min().item():.4f}, max={log_std.max().item():.4f}")
+                layer_aux_loss = torch.nan_to_num(layer_aux_loss)
+
+            total_aux_loss += layer_aux_loss
 
             # 6. Preparar entrada para el LSTM (determinista)
             lstm_input = torch.cat([mu, log_std], dim=-1)
@@ -292,11 +301,11 @@ def train_model(model, optimizer, train_loader, val_loader, device, args, output
     criterion = nn.BCEWithLogitsLoss()
     
     epochs_no_improve = 0
-    last_val_metrics = { 'loss': 0.0, 'auroc': 0.0 }
-
+    
     for epoch in range(start_epoch, args.epochs):
         model.train()
         total_loss, total_task_loss, total_aux_loss = 0, 0, 0
+        batches_processed = 0
         
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
         for i, (batched_by_layer, labels, _) in enumerate(progress_bar):
@@ -310,6 +319,13 @@ def train_model(model, optimizer, train_loader, val_loader, device, args, output
             task_loss = criterion(logits, labels)
             loss = task_loss + args.aux_loss_weight * aux_loss
             
+            if torch.isnan(loss):
+                print(f"\nWARNING: NaN detected in training loss for batch {i}. Skipping update.")
+                print(f"  task_loss: {task_loss.item():.4f}, aux_loss: {aux_loss.item():.4f}")
+                print(f"  logits stats: mean={logits.mean().item():.4f}, std={logits.std().item():.4f}, min={logits.min().item():.4f}, max={logits.max().item():.4f}")
+                del loss, task_loss, aux_loss, logits, labels; gc.collect(); torch.cuda.empty_cache()
+                continue
+            
             loss.backward()
             # Gradient Clipping: Vital para evitar explosión cuando la incertidumbre es alta
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -318,21 +334,24 @@ def train_model(model, optimizer, train_loader, val_loader, device, args, output
             total_loss += loss.item()
             total_task_loss += task_loss.item()
             total_aux_loss += aux_loss.item()
+            batches_processed += 1
             
-            progress_bar.set_postfix({
-                'loss': f"{total_loss / (i + 1):.4f}",
-                'val_loss': f"{last_val_metrics['loss']:.4f}",
-                'val_auroc': f"{last_val_metrics['auroc']:.4f}"
-            })
+            if batches_processed > 0:
+                progress_bar.set_postfix({
+                    'loss': total_loss / batches_processed,
+                    'task': total_task_loss / batches_processed,
+                    'aux': total_aux_loss / batches_processed
+                })
             
             del loss, task_loss, aux_loss, logits, labels; gc.collect(); torch.cuda.empty_cache()
 
         # Validation
         val_probs, val_labels = [], []
         total_val_loss, total_val_task_loss, total_val_aux_loss = 0.0, 0.0, 0.0
+        val_batches_processed = 0
         model.eval()
         with torch.no_grad():
-            for batched_by_layer, labels, _ in val_loader:
+            for i, (batched_by_layer, labels, _) in enumerate(val_loader):
                 if batched_by_layer is None: continue
                 batched_by_layer_gpu = [d.to(device) for d in batched_by_layer]
                 labels_gpu = labels.to(device).unsqueeze(1)
@@ -341,17 +360,23 @@ def train_model(model, optimizer, train_loader, val_loader, device, args, output
                 
                 task_loss_val = criterion(logits, labels_gpu)
                 loss_val = task_loss_val + args.aux_loss_weight * aux_loss_val
-                
-                total_val_loss += loss_val.item()
-                total_val_task_loss += task_loss_val.item()
-                total_val_aux_loss += aux_loss_val.item()
+
+                if torch.isnan(loss_val):
+                    print(f"\nWARNING: NaN detected in validation loss for batch {i}. Skipping.")
+                    print(f"  task_loss_val: {task_loss_val.item():.4f}, aux_loss_val: {aux_loss_val.item():.4f}")
+                    print(f"  logits stats: mean={logits.mean().item():.4f}, std={logits.std().item():.4f}, min={logits.min().item():.4f}, max={logits.max().item():.4f}")
+                else:
+                    total_val_loss += loss_val.item()
+                    total_val_task_loss += task_loss_val.item()
+                    total_val_aux_loss += aux_loss_val.item()
+                    val_batches_processed += 1
 
                 val_probs.extend(torch.sigmoid(logits).cpu().numpy().flatten())
                 val_labels.extend(labels.numpy().flatten())
 
-        avg_val_loss = total_val_loss / len(val_loader) if len(val_loader) > 0 else 0
-        avg_val_task_loss = total_val_task_loss / len(val_loader) if len(val_loader) > 0 else 0
-        avg_val_aux_loss = total_val_aux_loss / len(val_loader) if len(val_loader) > 0 else 0
+        avg_val_loss = total_val_loss / val_batches_processed if val_batches_processed > 0 else 0
+        avg_val_task_loss = total_val_task_loss / val_batches_processed if val_batches_processed > 0 else 0
+        avg_val_aux_loss = total_val_aux_loss / val_batches_processed if val_batches_processed > 0 else 0
 
         val_probs_np, val_labels_np = np.array(val_probs), np.array(val_labels)
         optimal_threshold = find_optimal_threshold(val_labels_np, val_probs_np)
@@ -368,11 +393,12 @@ def train_model(model, optimizer, train_loader, val_loader, device, args, output
                 'f1': f1_score(val_labels_np, preds, zero_division=0)
             }
         
-        avg_train_loss = total_loss / len(train_loader) if len(train_loader) > 0 else 0
-        avg_task_loss = total_task_loss / len(train_loader) if len(train_loader) > 0 else 0
-        avg_aux_loss = total_aux_loss / len(train_loader) if len(train_loader) > 0 else 0
+        avg_train_loss = total_loss / batches_processed if batches_processed > 0 else 0
+        avg_task_loss = total_task_loss / batches_processed if batches_processed > 0 else 0
+        avg_aux_loss = total_aux_loss / batches_processed if batches_processed > 0 else 0
 
-        print(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.4f}, Val Loss={avg_val_loss:.4f}, "
+        print(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.4f} (Task={avg_task_loss:.4f}, Aux={avg_aux_loss:.4f}), "
+              f"Val Loss={avg_val_loss:.4f} (Task={avg_val_task_loss:.4f}, Aux={avg_val_aux_loss:.4f}), "
               f"Val AUROC={val_metrics['auroc']:.4f}, Val F1={val_metrics['f1']:.4f} (thr={optimal_threshold:.3f})")
         
         history[epoch] = {
@@ -380,8 +406,6 @@ def train_model(model, optimizer, train_loader, val_loader, device, args, output
             'val_loss': avg_val_loss, 'val_task_loss': avg_val_task_loss, 'val_aux_loss': avg_val_aux_loss,
             'val_metrics': val_metrics, 'optimal_threshold': optimal_threshold
         }
-
-        last_val_metrics = {'loss': avg_val_loss, 'auroc': val_metrics['auroc']}
 
         # Guardado del mejor modelo
         if val_metrics['auroc'] > best_val_auroc:
