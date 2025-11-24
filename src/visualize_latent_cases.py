@@ -1,24 +1,17 @@
 """
 Visualización de Trayectorias Latentes para Casos Específicos.
 
-Este script carga un modelo GraphSequenceClassifier entrenado y busca 4 casos de uso
-específicos en el dataset de validación para visualizar cómo evolucionan sus
-representaciones latentes (μ) a lo largo del tiempo.
-
-Casos de Uso:
-1.  **True Positive (Alta Confianza):** Una alucinación que el modelo detecta con alta probabilidad.
-2.  **True Positive (Baja Confianza):** Una alucinación que el modelo detecta con duda (cercano al umbral).
-3.  **True Negative (Baja Confianza):** Un texto verídico que el modelo casi clasifica como alucinación.
-4.  **True Negative (Alta Confianza):** Un texto verídico que el modelo clasifica correctamente con alta probabilidad.
+Este script carga un modelo GraphSequenceClassifier entrenado y busca 6 casos de uso
+específicos (3 alucinaciones de alta confianza y 3 verdades de alta confianza)
+en el dataset de validación para visualizar y comparar sus trayectorias latentes.
 
 El script realiza los siguientes pasos:
 1.  Carga el modelo y los datos de validación.
-2.  Itera sobre un subconjunto de los datos para encontrar los 4 casos de interés.
-3.  Para cada caso, extrae la secuencia de vectores de media latente (μ) pasando los datos
-    a través del encoder del modelo.
-4.  Usa PCA para reducir la dimensionalidad de todas las secuencias a 2D.
-5.  Grafica las 4 trayectorias, estilizadas por caso y confianza, con marcadores
-    de inicio y fin.
+2.  Itera sobre un subconjunto de los datos para encontrar los 6 casos de interés.
+3.  Para cada caso, extrae la secuencia de vectores de media latente (μ).
+4.  Usa PCA para reducir la dimensionalidad a 2D.
+5.  Grafica las 6 trayectorias, aplicando un estilo similar al de `visualize_baseline.py`,
+    mostrando cada estado como un punto en la trayectoria y eliminando los números de los ejes.
 """
 import torch
 import numpy as np
@@ -40,62 +33,57 @@ logging.getLogger('matplotlib.font_manager').disabled = True
 
 def find_target_cases(model, data_loader, device, num_samples_to_check=200):
     """
-    Busca en el data_loader los 4 casos de uso específicos.
+    Busca en el data_loader hasta 3 casos de alucinaciones claras y 3 de verdades claras.
     """
-    model.eval() 
+    model.eval()
     
-    # Estructura para almacenar el mejor candidato encontrado para cada caso
-    # (distancia_al_target, probabilidad, índice_en_loader, datos)
-    candidates = {
-        'tp_clear': {'dist': float('inf'), 'prob': -1, 'idx': -1, 'data': None, 'label': -1},
-        'tp_border': {'dist': float('inf'), 'prob': -1, 'idx': -1, 'data': None, 'label': -1},
-        'tn_border': {'dist': float('inf'), 'prob': -1, 'idx': -1, 'data': None, 'label': -1},
-        'tn_clear': {'dist': float('inf'), 'prob': -1, 'idx': -1, 'data': None, 'label': -1},
-    }
+    # Listas para almacenar todos los candidatos encontrados
+    tp_candidates = []
+    tn_candidates = []
     
-    print(f"🔍 Buscando {num_samples_to_check} muestras para encontrar casos de uso...")
+    print(f"🔍 Buscando en hasta {num_samples_to_check} muestras para encontrar 3 TPs y 3 TNs de alta confianza...")
     with torch.no_grad():
-        for i, (batched_by_layer, labels, _) in enumerate(tqdm(data_loader, total=num_samples_to_check)):
+        for i, data in enumerate(tqdm(data_loader, total=num_samples_to_check, desc="Buscando casos")):
             if i >= num_samples_to_check:
                 break
+            if not data: continue
             
-            # Procesar de a uno para mantener la correspondencia
+            batched_by_layer, labels, _ = data
+            if not batched_by_layer or not labels.numel(): continue
+
             graph_seq, label = batched_by_layer, labels[0].item()
             
             graph_seq_gpu = [d.to(device) for d in graph_seq]
             logits, _ = model(graph_seq_gpu)
             prob = torch.sigmoid(logits).item()
 
-            if label == 1: # Alucinación (True Positive)
-                # TP Claro (target > 0.9)
-                dist_clear = abs(prob - 0.95)
-                if prob > 0.9 and dist_clear < candidates['tp_clear']['dist']:
-                    candidates['tp_clear'] = {'dist': dist_clear, 'prob': prob, 'idx': i, 'data': graph_seq, 'label': label}
+            if label == 1 and prob > 0.9: # Alucinación (True Positive) de alta confianza
+                # Guardar probabilidad para ordenar por ella después
+                tp_candidates.append({'prob': prob, 'data': graph_seq, 'label': label})
 
-                # TP Dudoso (target ~0.55)
-                dist_border = abs(prob - 0.55)
-                if 0.45 < prob < 0.65 and dist_border < candidates['tp_border']['dist']:
-                    candidates['tp_border'] = {'dist': dist_border, 'prob': prob, 'idx': i, 'data': graph_seq, 'label': label}
+            elif label == 0 and prob < 0.1: # Verdad (True Negative) de alta confianza
+                # Guardar 1-prob para que mayor sea mejor (más confianza)
+                tn_candidates.append({'prob': prob, 'data': graph_seq, 'label': label})
 
-            else: # Verdad (True Negative)
-                # TN Claro (target < 0.1)
-                dist_clear = abs(prob - 0.05)
-                if prob < 0.1 and dist_clear < candidates['tn_clear']['dist']:
-                    candidates['tn_clear'] = {'dist': dist_clear, 'prob': prob, 'idx': i, 'data': graph_seq, 'label': label}
-                
-                # TN Dudoso (target ~0.45)
-                dist_border = abs(prob - 0.45)
-                if 0.35 < prob < 0.55 and dist_border < candidates['tn_border']['dist']:
-                    candidates['tn_border'] = {'dist': dist_border, 'prob': prob, 'idx': i, 'data': graph_seq, 'label': label}
+    # Ordenar candidatos: TPs por probabilidad descendente, TNs por probabilidad ascendente
+    tp_candidates.sort(key=lambda x: x['prob'], reverse=True)
+    tn_candidates.sort(key=lambda x: x['prob'])
+
+    # Formatear el diccionario de salida con los 3 mejores de cada categoría
+    final_cases = {}
+    for i in range(3):
+        if i < len(tp_candidates):
+            final_cases[f'tp_clear_{i+1}'] = tp_candidates[i]
+        if i < len(tn_candidates):
+            final_cases[f'tn_clear_{i+1}'] = tn_candidates[i]
 
     print("\n--- Casos Encontrados ---")
-    for name, c in candidates.items():
-        if c['data']:
-            print(f"  ✅ {name.upper()}: Muestra #{c['idx']}, Prob={c['prob']:.3f}, Label={c['label']}")
-        else:
-            print(f"  ❌ {name.upper()}: No se encontró un caso ideal.")
+    for name, c in final_cases.items():
+        print(f"  ✅ {name.upper()}: Prob={c['prob']:.3f}, Label={c['label']}")
+    if len(final_cases) < 6:
+        print("  ⚠️ No se encontraron los 6 casos de alta confianza, se usarán los que se encontraron.")
             
-    return candidates
+    return final_cases
 
 def extract_latent_trajectories(model, target_cases, device):
     """
@@ -164,8 +152,12 @@ def extract_latent_trajectories(model, target_cases, device):
 
 def visualize_trajectories(trajectories, cases_info, output_path):
     """
-    Aplica PCA y grafica las trayectorias 2D.
+    Aplica PCA y grafica las trayectorias 2D con el nuevo estilo.
     """
+    if not trajectories:
+        print("No hay trayectorias para visualizar.")
+        return
+
     print("🎨 Visualizando trayectorias con PCA...")
     
     all_mus = np.vstack([traj for traj in trajectories.values()])
@@ -177,33 +169,48 @@ def visualize_trajectories(trajectories, cases_info, output_path):
     # Transformar cada trayectoria individualmente
     transformed_trajs = {name: pca.transform(traj) for name, traj in trajectories.items()}
     
-    plt.style.use('seaborn-v0_8-whitegrid')
     fig, ax = plt.subplots(figsize=(12, 10))
     
-    styles = {
-        'tp_clear':  {'color': 'red', 'linestyle': '-', 'label': 'TP (Confianza Alta)', 'alpha': 1.0},
-        'tp_border': {'color': 'red', 'linestyle': '--', 'label': 'TP (Borde)', 'alpha': 0.7},
-        'tn_clear':  {'color': 'blue', 'linestyle': '-', 'label': 'TN (Confianza Alta)', 'alpha': 1.0},
-        'tn_border': {'color': 'blue', 'linestyle': '--', 'label': 'TN (Borde)', 'alpha': 0.7},
-    }
+    # Paleta de colores y estilos
+    colors = {'tp': '#d62728', 'tn': '#1f77b4'} # Rojo para TP, Azul para TN
+    markers = ['o', 's', '^']
+    alphas = [1.0, 0.7, 0.4]
 
-    for name, traj_2d in transformed_trajs.items():
-        style = styles[name]
-        ax.plot(traj_2d[:, 0], traj_2d[:, 1], color=style['color'], linestyle=style['linestyle'], alpha=style['alpha'], label=style['label'])
+    for i, name in enumerate(sorted(transformed_trajs.keys())):
+        traj_2d = transformed_trajs[name]
+        case_type = 'tp' if 'tp' in name else 'tn'
+        instance_index = int(name.split('_')[-1]) - 1
+        
+        color = colors[case_type]
+        marker = markers[instance_index]
+        alpha = alphas[instance_index]
+        label = f'Alucinación {instance_index+1}' if case_type == 'tp' else f'Verdad {instance_index+1}'
+
+        # Plot de la trayectoria con marcadores en cada punto (estado)
+        ax.plot(traj_2d[:, 0], traj_2d[:, 1], 
+                color=color, 
+                alpha=alpha, 
+                label=label,
+                linewidth=2,
+                marker=marker,
+                markersize=6)
         
         # Marcador de Inicio
-        ax.scatter(traj_2d[0, 0], traj_2d[0, 1], marker='o', color=style['color'], s=100, edgecolors='black', zorder=5)
-        ax.text(traj_2d[0, 0], traj_2d[0, 1] + 0.05, 'Inicio', fontsize=9, ha='center', color=style['color'])
+        ax.scatter(traj_2d[0, 0], traj_2d[0, 1], marker='o', s=150, facecolors='none', edgecolors=color, linewidth=2, zorder=5)
         
         # Marcador de Fin
-        ax.scatter(traj_2d[-1, 0], traj_2d[-1, 1], marker='X', color=style['color'], s=150, edgecolors='black', zorder=5)
-        ax.text(traj_2d[-1, 0], traj_2d[-1, 1] - 0.15, 'Fin', fontsize=9, ha='center', color=style['color'])
+        ax.scatter(traj_2d[-1, 0], traj_2d[-1, 1], marker='X', color=color, s=150, edgecolors='black', zorder=5)
 
-    ax.set_title('Trayectorias en Espacio Latente (PCA) de Casos Específicos', fontsize=16)
+    ax.set_title('Evolución de Trayectorias en Espacio Latente (PCA)', fontsize=16, fontweight='bold')
     ax.set_xlabel('Componente Principal 1', fontsize=12)
     ax.set_ylabel('Componente Principal 2', fontsize=12)
-    ax.legend(title="Leyenda de Casos", fontsize=10)
-    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+    
+    # Eliminar números de los ejes
+    ax.set_xticks([])
+    ax.set_yticks([])
+    
+    ax.legend(title="Casos de Alta Confianza", fontsize=10)
+    ax.grid(True, which='both', linestyle='--', linewidth=0.4)
     
     fig.tight_layout()
     plt.savefig(output_path, dpi=300)
@@ -218,18 +225,21 @@ def main(args):
     # --- Carga de Datos ---
     gnn_dir = Path(args.preprocessed_dir) / 'gnn'
     all_files = sorted(list(gnn_dir.glob('preprocessed_*.pt')))
-    # Usaremos una porción para validación
-    _ , val_files, _ = np.split(all_files, [int(0.7*len(all_files)), int(0.85*len(all_files))])
+    _ , val_files, _ = np.split(all_files, [int(len(all_files) * 0.7), int(len(all_files) * 0.85)])
 
-    # El dataset para buscar casos (de a uno)
-    val_dataset = PreprocessedGNNDataset(gnn_dir, val_files)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, collate_fn=collate_gnn_batch)
+    val_dataset = PreprocessedGNNDataset(gnn_dir, list(val_files))
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, collate_fn=collate_gnn_batch, num_workers=0)
     
     # Para obtener hidden_dim, necesitamos cargar al menos un dato
-    temp_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, collate_fn=collate_gnn_batch)
-    sample_data = next(iter(temp_loader))
-    hidden_dim = sample_data[0][0].x.shape[-1]
-    del temp_loader, sample_data; gc.collect()
+    try:
+        temp_loader = torch.utils.data.DataLoader(PreprocessedGNNDataset(gnn_dir, [val_files[0]]), batch_size=1, collate_fn=collate_gnn_batch)
+        sample_data = next(iter(temp_loader))
+        hidden_dim = sample_data[0][0].x.shape[-1]
+        del temp_loader, sample_data
+        gc.collect()
+    except (StopIteration, IndexError):
+        print("Error: No se pudieron cargar datos de validación para determinar la dimensión de entrada.")
+        return
 
     # --- Carga de Modelo ---
     model_path = Path(args.model_path)
@@ -253,10 +263,7 @@ def main(args):
     trajectories = extract_latent_trajectories(model, target_cases, device)
     
     # 3. Visualizar
-    if trajectories:
-        visualize_trajectories(trajectories, target_cases, args.output_file)
-    else:
-        print("No se encontraron trayectorias para visualizar. Terminando.")
+    visualize_trajectories(trajectories, target_cases, args.output_file)
 
 
 if __name__ == '__main__':
@@ -266,7 +273,7 @@ if __name__ == '__main__':
     parser.add_argument('--output-file', type=str, default='visualizations/latent_trajectories_cases.png', help='Ruta para guardar el gráfico.')
     parser.add_argument('--num-samples', type=int, default=200, help='Número de muestras a revisar para encontrar los casos.')
     # Añadir argumentos del modelo para poder instanciarlo
-    parser.add_argument('--gnn-hidden', type=int, default=128)
+    parser.add_argument('--gnn-hidden', type=int, default=256)
     parser.add_argument('--latent-dim', type=int, default=128)
     parser.add_argument('--lstm-hidden', type=int, default=32)
     parser.add_argument('--num-lstm-layers', type=int, default=2)
