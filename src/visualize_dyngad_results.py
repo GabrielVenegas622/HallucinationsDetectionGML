@@ -114,10 +114,12 @@ def plot_losses(history, output_dir):
     axes[1, 0].plot(epochs, train_aux_loss, label='Train', color='orange', linewidth=2, marker='o', markersize=3, alpha=0.8)
     axes[1, 0].set_xlabel('Epoch', fontsize=12)
     axes[1, 0].set_ylabel('Aux Loss', fontsize=12)
+    axes[1, 0].set_yscale('log') # Escala logarítmica para Aux Loss
     axes[1, 0].grid(True, alpha=0.3)
 
     axes[1, 1].plot(epochs, val_aux_loss, label='Validation', color='orange', linewidth=2, marker='o', markersize=3)
     axes[1, 1].set_xlabel('Epoch', fontsize=12)
+    axes[1, 1].set_yscale('log') # Escala logarítmica para Aux Loss
     axes[1, 1].grid(True, alpha=0.3)
     
     plt.tight_layout(rect=[0, 0, 1, 0.96])
