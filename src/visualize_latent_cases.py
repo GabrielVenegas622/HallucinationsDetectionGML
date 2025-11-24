@@ -1,16 +1,17 @@
 """
 Visualización de Trayectorias Latentes para Casos Específicos.
 
-Este script carga un modelo GraphSequenceClassifier entrenado y busca 6 casos de uso
-específicos (3 alucinaciones de alta confianza y 3 verdades de alta confianza)
+Este script carga un modelo GraphSequenceClassifier entrenado, busca 4 casos de uso
+específicos (2 alucinaciones de alta confianza y 2 verdades de alta confianza)
 en el dataset de validación para visualizar y comparar sus trayectorias latentes.
 
 El script realiza los siguientes pasos:
 1.  Carga el modelo y los datos de validación.
-2.  Itera sobre un subconjunto de los datos para encontrar los 6 casos de interés.
-3.  Para cada caso, extrae la secuencia de vectores de media latente (μ).
-4.  Usa PCA para reducir la dimensionalidad a 2D.
-5.  Grafica las 6 trayectorias, aplicando un estilo similar al de `visualize_baseline.py`,
+2.  Itera sobre un subconjunto de los datos para encontrar los casos de interés.
+3.  Selecciona aleatoriamente 2 casos de cada categoría (TP y TN).
+4.  Para cada caso, extrae la secuencia de vectores de media latente (μ).
+5.  Usa PCA para reducir la dimensionalidad a 2D.
+6.  Grafica las 4 trayectorias, aplicando un estilo similar al de `visualize_baseline.py`,
     mostrando cada estado como un punto en la trayectoria y eliminando los números de los ejes.
 """
 import torch
@@ -22,6 +23,7 @@ from sklearn.decomposition import PCA
 from tqdm import tqdm
 import gc
 import torch.nn.functional as F # Importar F para relu
+import random
 
 # Asumiendo que DynGAD.py está en el mismo directorio o en el python path
 from DynGAD import GraphSequenceClassifier, PreprocessedGNNDataset, collate_gnn_batch
@@ -33,7 +35,7 @@ logging.getLogger('matplotlib.font_manager').disabled = True
 
 def find_target_cases(model, data_loader, device, num_samples_to_check=200):
     """
-    Busca en el data_loader hasta 3 casos de alucinaciones claras y 3 de verdades claras.
+    Busca y selecciona aleatoriamente 2 casos de alucinaciones claras y 2 de verdades claras.
     """
     model.eval()
     
@@ -41,7 +43,7 @@ def find_target_cases(model, data_loader, device, num_samples_to_check=200):
     tp_candidates = []
     tn_candidates = []
     
-    print(f"🔍 Buscando en hasta {num_samples_to_check} muestras para encontrar 3 TPs y 3 TNs de alta confianza...")
+    print(f"🔍 Buscando en hasta {num_samples_to_check} muestras para encontrar 2 TPs y 2 TNs de alta confianza...")
     with torch.no_grad():
         for i, data in enumerate(tqdm(data_loader, total=num_samples_to_check, desc="Buscando casos")):
             if i >= num_samples_to_check:
@@ -58,30 +60,32 @@ def find_target_cases(model, data_loader, device, num_samples_to_check=200):
             prob = torch.sigmoid(logits).item()
 
             if label == 1 and prob > 0.9: # Alucinación (True Positive) de alta confianza
-                # Guardar probabilidad para ordenar por ella después
                 tp_candidates.append({'prob': prob, 'data': graph_seq, 'label': label})
 
             elif label == 0 and prob < 0.1: # Verdad (True Negative) de alta confianza
-                # Guardar 1-prob para que mayor sea mejor (más confianza)
                 tn_candidates.append({'prob': prob, 'data': graph_seq, 'label': label})
 
-    # Ordenar candidatos: TPs por probabilidad descendente, TNs por probabilidad ascendente
-    tp_candidates.sort(key=lambda x: x['prob'], reverse=True)
-    tn_candidates.sort(key=lambda x: x['prob'])
-
-    # Formatear el diccionario de salida con los 3 mejores de cada categoría
+    # Seleccionar aleatoriamente 2 de cada categoría si hay suficientes
     final_cases = {}
-    for i in range(3):
-        if i < len(tp_candidates):
-            final_cases[f'tp_clear_{i+1}'] = tp_candidates[i]
-        if i < len(tn_candidates):
-            final_cases[f'tn_clear_{i+1}'] = tn_candidates[i]
+    if len(tp_candidates) >= 2:
+        selected_tps = random.sample(tp_candidates, 2)
+        final_cases['tp_clear_1'] = selected_tps[0]
+        final_cases['tp_clear_2'] = selected_tps[1]
+    else:
+        print(f"⚠️ No se encontraron suficientes casos de alucinaciones de alta confianza (encontrados: {len(tp_candidates)}).")
 
-    print("\n--- Casos Encontrados ---")
+    if len(tn_candidates) >= 2:
+        selected_tns = random.sample(tn_candidates, 2)
+        final_cases['tn_clear_1'] = selected_tns[0]
+        final_cases['tn_clear_2'] = selected_tns[1]
+    else:
+        print(f"⚠️ No se encontraron suficientes casos de verdad de alta confianza (encontrados: {len(tn_candidates)}).")
+
+    print("\n--- Casos Seleccionados Aleatoriamente ---")
     for name, c in final_cases.items():
         print(f"  ✅ {name.upper()}: Prob={c['prob']:.3f}, Label={c['label']}")
-    if len(final_cases) < 6:
-        print("  ⚠️ No se encontraron los 6 casos de alta confianza, se usarán los que se encontraron.")
+    if len(final_cases) < 4:
+        print("  ❌ No se graficará por no tener suficientes casos.")
             
     return final_cases
 
@@ -173,18 +177,30 @@ def visualize_trajectories(trajectories, cases_info, output_path):
     
     # Paleta de colores y estilos
     colors = {'tp': '#d62728', 'tn': '#1f77b4'} # Rojo para TP, Azul para TN
-    markers = ['o', 's', '^']
-    alphas = [1.0, 0.7, 0.4]
+    markers = ['o', 's']
+    alphas = [1.0, 0.7]
 
-    for i, name in enumerate(sorted(transformed_trajs.keys())):
+    # Contadores para asignar estilos
+    tp_count = 0
+    tn_count = 0
+
+    for name in sorted(transformed_trajs.keys()):
         traj_2d = transformed_trajs[name]
-        case_type = 'tp' if 'tp' in name else 'tn'
-        instance_index = int(name.split('_')[-1]) - 1
         
+        if 'tp' in name:
+            case_type = 'tp'
+            style_idx = tp_count
+            label = f'Alucinación {style_idx+1}'
+            tp_count += 1
+        else:
+            case_type = 'tn'
+            style_idx = tn_count
+            label = f'Verdad {style_idx+1}'
+            tn_count += 1
+
         color = colors[case_type]
-        marker = markers[instance_index]
-        alpha = alphas[instance_index]
-        label = f'Alucinación {instance_index+1}' if case_type == 'tp' else f'Verdad {instance_index+1}'
+        marker = markers[style_idx]
+        alpha = alphas[style_idx]
 
         # Plot de la trayectoria con marcadores en cada punto (estado)
         ax.plot(traj_2d[:, 0], traj_2d[:, 1], 
@@ -193,7 +209,8 @@ def visualize_trajectories(trajectories, cases_info, output_path):
                 label=label,
                 linewidth=2,
                 marker=marker,
-                markersize=6)
+                markersize=6,
+                linestyle='-')
         
         # Marcador de Inicio
         ax.scatter(traj_2d[0, 0], traj_2d[0, 1], marker='o', s=150, facecolors='none', edgecolors=color, linewidth=2, zorder=5)
@@ -225,15 +242,24 @@ def main(args):
     # --- Carga de Datos ---
     gnn_dir = Path(args.preprocessed_dir) / 'gnn'
     all_files = sorted(list(gnn_dir.glob('preprocessed_*.pt')))
-    _ , val_files, _ = np.split(all_files, [int(len(all_files) * 0.7), int(len(all_files) * 0.85)])
+    
+    # FIX: Usar slicing en lugar de np.split para evitar seleccionar un solo archivo
+    train_idx = int(len(all_files) * 0.7)
+    val_idx = int(len(all_files) * 0.85)
+    val_files = all_files[train_idx:val_idx]
+
+    if not val_files:
+        print("Error: No se encontraron archivos de validación con el split 70/15/15.")
+        return
 
     val_dataset = PreprocessedGNNDataset(gnn_dir, list(val_files))
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, collate_fn=collate_gnn_batch, num_workers=0)
     
     # Para obtener hidden_dim, necesitamos cargar al menos un dato
     try:
+        # Usamos el primer archivo de validación para eficiencia
         temp_loader = torch.utils.data.DataLoader(PreprocessedGNNDataset(gnn_dir, [val_files[0]]), batch_size=1, collate_fn=collate_gnn_batch)
-        sample_data = next(iter(temp_loader))
+        sample_data, _, _ = next(iter(temp_loader))
         hidden_dim = sample_data[0][0].x.shape[-1]
         del temp_loader, sample_data
         gc.collect()
