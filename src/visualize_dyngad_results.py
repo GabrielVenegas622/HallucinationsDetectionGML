@@ -51,69 +51,76 @@ def parse_dyngad_history(history_dict):
         return None
 
     train_task_losses = []
-    val_losses = []
+    train_aux_losses = []
+    val_task_losses = []
+    val_aux_losses = []
     val_aurocs = []
     
-    # Ordenar por número de época, que son las claves del diccionario
     epochs = sorted(history_dict.keys(), key=lambda x: int(x))
 
     for epoch in epochs:
         epoch_data = history_dict[epoch]
-        if 'train_task_loss' in epoch_data:
-            train_task_losses.append(epoch_data['train_task_loss'])
-        if 'val_loss' in epoch_data:
-            val_losses.append(epoch_data['val_loss'])
+        train_task_losses.append(epoch_data.get('train_task_loss', np.nan))
+        train_aux_losses.append(epoch_data.get('train_aux_loss', np.nan))
+        val_task_losses.append(epoch_data.get('val_task_loss', np.nan))
+        val_aux_losses.append(epoch_data.get('val_aux_loss', np.nan))
+        
         if 'val_metrics' in epoch_data and 'auroc' in epoch_data['val_metrics']:
             val_aurocs.append(epoch_data['val_metrics']['auroc'])
             
     return {
-        'train_loss': train_task_losses,
-        'val_loss': val_losses,
+        'train_task_loss': train_task_losses,
+        'train_aux_loss': train_aux_losses,
+        'val_task_loss': val_task_losses,
+        'val_aux_loss': val_aux_losses,
         'val_auroc': val_aurocs
     }
 
 def plot_losses(history, output_dir):
     """
-    Genera gráficas de loss para el modelo DynGAD.
+    Genera una grilla de 2x2 de losses para el modelo DynGAD.
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    color = '#2ca02c' # Verde, como el GNN-VAE en el baseline
+    color = '#2ca02c'
     label = 'DynGAD (GINE-VAE+LSTM)'
     
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10), sharex=True)
+    fig.suptitle('Training & Validation Losses', fontsize=16, fontweight='bold')
     
-    train_losses = history.get('train_loss', [])
-    val_losses = history.get('val_loss', [])
+    train_task_loss = history.get('train_task_loss', [])
+    val_task_loss = history.get('val_task_loss', [])
+    train_aux_loss = history.get('train_aux_loss', [])
+    val_aux_loss = history.get('val_aux_loss', [])
     
-    if not train_losses and not val_losses:
+    if not train_task_loss:
         print("No se encontraron datos de loss para graficar.")
         plt.close(fig)
         return
         
-    epochs = range(1, len(train_losses) + 1)
+    epochs = range(1, len(train_task_loss) + 1)
     
-    # Plot train loss
-    if train_losses:
-        axes[0].plot(epochs, train_losses, label=label, color=color, linewidth=2, marker='o', markersize=3)
+    # --- Fila 1: Task Loss ---
+    axes[0, 0].plot(epochs, train_task_loss, label='Train', color=color, linewidth=2, marker='o', markersize=3, alpha=0.8)
+    axes[0, 0].set_title('Training')
+    axes[0, 0].set_ylabel('Task Loss', fontsize=12)
+    axes[0, 0].grid(True, alpha=0.3)
     
-    # Plot val loss
-    if val_losses:
-        axes[1].plot(epochs, val_losses, label=label, color=color, linewidth=2, marker='o', markersize=3)
+    axes[0, 1].plot(epochs, val_task_loss, label='Validation', color=color, linewidth=2, marker='o', markersize=3)
+    axes[0, 1].set_title('Validation')
+    axes[0, 1].grid(True, alpha=0.3)
     
-    axes[0].set_xlabel('Epoch', fontsize=12)
-    axes[0].set_ylabel('Task Loss', fontsize=12)
-    axes[0].set_title('Training Task Loss', fontsize=14, fontweight='bold')
-    axes[0].legend(fontsize=10)
-    axes[0].grid(True, alpha=0.3)
+    # --- Fila 2: Aux Loss ---
+    axes[1, 0].plot(epochs, train_aux_loss, label='Train', color='orange', linewidth=2, marker='o', markersize=3, alpha=0.8)
+    axes[1, 0].set_xlabel('Epoch', fontsize=12)
+    axes[1, 0].set_ylabel('Aux Loss', fontsize=12)
+    axes[1, 0].grid(True, alpha=0.3)
+
+    axes[1, 1].plot(epochs, val_aux_loss, label='Validation', color='orange', linewidth=2, marker='o', markersize=3)
+    axes[1, 1].set_xlabel('Epoch', fontsize=12)
+    axes[1, 1].grid(True, alpha=0.3)
     
-    axes[1].set_xlabel('Epoch', fontsize=12)
-    axes[1].set_ylabel('Loss', fontsize=12)
-    axes[1].set_title('Validation Loss', fontsize=14, fontweight='bold')
-    axes[1].legend(fontsize=10)
-    axes[1].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     output_path = os.path.join(output_dir, f'dyngad_losses_{timestamp}.png')
