@@ -282,4 +282,7 @@ if __name__ == '__main__':
     parser.add_argument('--force-cpu', action='store_true')
 
     args = parser.parse_args()
-    main(args)
+    if GRAPH_TOOL_AVAILABLE:
+        main(args)
+    else:
+        print("El script no puede continuar porque 'graph-tool' no está instalado.")
