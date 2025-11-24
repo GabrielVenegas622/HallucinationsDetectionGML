@@ -28,6 +28,7 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from tqdm import tqdm
 import gc
+import torch.nn.functional as F # Importar F para relu
 
 # Asumiendo que DynGAD.py está en el mismo directorio o en el python path
 from DynGAD import GraphSequenceClassifier, PreprocessedGNNDataset, collate_gnn_batch
