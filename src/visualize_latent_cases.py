@@ -116,6 +116,30 @@ def extract_latent_trajectories(model, target_cases, device):
             for layer_data in graph_seq_gpu:
                 x, edge_index, edge_attr, batch = layer_data.x, layer_data.edge_index, layer_data.edge_attr, layer_data.batch
                 
+                # --- Bloque de Saneamiento de Datos (Copiado de DynGAD.py) ---
+                if edge_attr is not None and edge_attr.numel() > 0:
+                    edge_attr = edge_attr.float()
+                    if torch.isnan(edge_attr).any() or torch.isinf(edge_attr).any():
+                        edge_attr = torch.nan_to_num(edge_attr, nan=0.0, posinf=1.0, neginf=0.0)
+                    
+                    if edge_attr.dim() == 1:
+                        edge_attr = edge_attr.unsqueeze(1)
+                    
+                    if edge_attr.size(0) != edge_index.size(1):
+                        num_edges = edge_index.size(1)
+                        if edge_attr.size(0) > num_edges:
+                            edge_attr = edge_attr[:num_edges]
+                        else:
+                            padding = torch.zeros((num_edges - edge_attr.size(0), 1), 
+                                                dtype=edge_attr.dtype, device=edge_attr.device)
+                            edge_attr = torch.cat([edge_attr, padding], dim=0)
+                    
+                    edge_attr = torch.clamp(edge_attr, min=0.0, max=1.0)
+                else:
+                    num_edges = edge_index.size(1)
+                    edge_attr = torch.zeros((num_edges, 1), dtype=torch.float, device=x.device)
+                # --- Fin del Bloque de Saneamiento ---
+
                 # Replicando el forward del encoder
                 x = model.input_proj(x)
                 x_gnn = F.relu(model.bn1(model.conv1(x, edge_index, edge_attr)))
