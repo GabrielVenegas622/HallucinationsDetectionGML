@@ -115,6 +115,7 @@ def extract_latent_trajectories(model, target_cases, device):
             
             for layer_data in graph_seq_gpu:
                 x, edge_index, edge_attr, batch = layer_data.x, layer_data.edge_index, layer_data.edge_attr, layer_data.batch
+                x = x.float() # Asegurar que x sea float32
                 
                 # --- Bloque de Saneamiento de Datos (Copiado de DynGAD.py) ---
                 if edge_attr is not None and edge_attr.numel() > 0:
@@ -265,7 +266,7 @@ if __name__ == '__main__':
     parser.add_argument('--output-file', type=str, default='visualizations/latent_trajectories_cases.png', help='Ruta para guardar el gráfico.')
     parser.add_argument('--num-samples', type=int, default=200, help='Número de muestras a revisar para encontrar los casos.')
     # Añadir argumentos del modelo para poder instanciarlo
-    parser.add_argument('--gnn-hidden', type=int, default=256)
+    parser.add_argument('--gnn-hidden', type=int, default=128)
     parser.add_argument('--latent-dim', type=int, default=128)
     parser.add_argument('--lstm-hidden', type=int, default=32)
     parser.add_argument('--num-lstm-layers', type=int, default=2)

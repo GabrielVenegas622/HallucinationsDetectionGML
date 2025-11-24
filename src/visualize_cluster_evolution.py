@@ -100,6 +100,7 @@ def extract_and_reconstruct_adj(model, graph_seq, device, num_clusters, latent_d
     with torch.no_grad():
         layer_data = graph_seq.to(device)
         x, edge_index, edge_attr, batch = layer_data.x, layer_data.edge_index, layer_data.edge_attr, layer_data.batch
+        x = x.float() # Asegurar que x sea float32
 
         # --- Bloque de Saneamiento de Datos ---
         if edge_attr is not None and edge_attr.numel() > 0:
